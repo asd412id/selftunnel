@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	serviceName        = "selftunnel"
+	defaultServiceName = "selftunnel"
 	serviceDescription = "SelfTunnel P2P Mesh VPN"
 )
 
@@ -23,13 +23,14 @@ func serviceCmd() *cobra.Command {
 		Long: `Manage SelfTunnel as a system service.
 
 Examples:
-  selftunnel service install    - Install and enable the service
-  selftunnel service uninstall  - Stop and remove the service
-  selftunnel service start      - Start the service
-  selftunnel service stop       - Stop the service
-  selftunnel service restart    - Restart the service
-  selftunnel service status     - Show service status
-  selftunnel service logs       - Show service logs`,
+  selftunnel service install              - Install with default name
+  selftunnel service install --name vpn1  - Install as 'selftunnel-vpn1'
+  selftunnel service uninstall            - Remove the service
+  selftunnel service start                - Start the service
+  selftunnel service stop                 - Stop the service
+  selftunnel service restart              - Restart the service
+  selftunnel service status               - Show service status
+  selftunnel service logs                 - Show service logs`,
 	}
 
 	cmd.AddCommand(
@@ -45,99 +46,159 @@ Examples:
 	return cmd
 }
 
+func getServiceName(name string) string {
+	if name == "" {
+		return defaultServiceName
+	}
+	return fmt.Sprintf("%s-%s", defaultServiceName, name)
+}
+
 func serviceInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install SelfTunnel as a system service",
+		Long: `Install SelfTunnel as a system service.
+
+Use --name to create multiple instances with different configurations:
+  selftunnel service install --name office
+  selftunnel service install --name home
+
+This creates services named 'selftunnel-office' and 'selftunnel-home'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				return installWindowsService()
+				return installWindowsService(svcName)
 			}
-			return installLinuxService()
+			return installLinuxService(svcName)
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name (creates 'selftunnel-<name>')")
+
+	return cmd
 }
 
 func serviceUninstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Uninstall SelfTunnel system service",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				return uninstallWindowsService()
+				return uninstallWindowsService(svcName)
 			}
-			return uninstallLinuxService()
+			return uninstallLinuxService(svcName)
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
+
+	return cmd
 }
 
 func serviceStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the SelfTunnel service",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				return runCommand("sc", "start", serviceName)
+				return runCommand("sc", "start", svcName)
 			}
-			return runCommand("systemctl", "start", serviceName)
+			return runCommand("systemctl", "start", svcName)
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
+
+	return cmd
 }
 
 func serviceStopCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the SelfTunnel service",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				return runCommand("sc", "stop", serviceName)
+				return runCommand("sc", "stop", svcName)
 			}
-			return runCommand("systemctl", "stop", serviceName)
+			return runCommand("systemctl", "stop", svcName)
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
+
+	return cmd
 }
 
 func serviceRestartCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "restart",
 		Short: "Restart the SelfTunnel service",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				runCommand("sc", "stop", serviceName)
-				return runCommand("sc", "start", serviceName)
+				runCommand("sc", "stop", svcName)
+				return runCommand("sc", "start", svcName)
 			}
-			return runCommand("systemctl", "restart", serviceName)
+			return runCommand("systemctl", "restart", svcName)
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
+
+	return cmd
 }
 
 func serviceStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var name string
+
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show SelfTunnel service status",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
-				return runCommand("sc", "query", serviceName)
+				return runCommand("sc", "query", svcName)
 			}
-			return runCommand("systemctl", "status", serviceName, "--no-pager")
+			return runCommand("systemctl", "status", svcName, "--no-pager")
 		},
 	}
+
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
+
+	return cmd
 }
 
 func serviceLogsCmd() *cobra.Command {
-	var follow bool
-	var lines int
+	var (
+		name   string
+		follow bool
+		lines  int
+	)
 
 	cmd := &cobra.Command{
 		Use:   "logs",
 		Short: "Show SelfTunnel service logs",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			svcName := getServiceName(name)
 			if runtime.GOOS == "windows" {
 				fmt.Println("On Windows, check Event Viewer for service logs")
 				return nil
 			}
 
-			cmdArgs := []string{"-u", serviceName}
+			cmdArgs := []string{"-u", svcName}
 			if follow {
 				cmdArgs = append(cmdArgs, "-f")
 			}
@@ -148,13 +209,14 @@ func serviceLogsCmd() *cobra.Command {
 		},
 	}
 
+	cmd.Flags().StringVar(&name, "name", "", "Service instance name")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "Number of lines to show")
 
 	return cmd
 }
 
-func installLinuxService() error {
+func installLinuxService(svcName string) error {
 	// Check if running as root
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("this command must be run as root (use sudo)")
@@ -170,8 +232,10 @@ func installLinuxService() error {
 		return fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	// Copy binary to /usr/local/bin if not already there
-	targetPath := "/usr/local/bin/selftunnel"
+	// Determine target binary path
+	targetPath := fmt.Sprintf("/usr/local/bin/%s", svcName)
+
+	// Copy binary if not already there
 	if execPath != targetPath {
 		fmt.Printf("Copying %s to %s...\n", execPath, targetPath)
 		input, err := os.ReadFile(execPath)
@@ -210,9 +274,9 @@ ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
-`, serviceDescription, targetPath, serviceName)
+`, serviceDescription, targetPath, svcName)
 
-	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
+	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", svcName)
 	fmt.Printf("Creating service file at %s...\n", servicePath)
 
 	if err := os.WriteFile(servicePath, []byte(serviceContent), 0644); err != nil {
@@ -227,48 +291,48 @@ WantedBy=multi-user.target
 
 	// Enable service
 	fmt.Println("Enabling service...")
-	if err := runCommand("systemctl", "enable", serviceName); err != nil {
+	if err := runCommand("systemctl", "enable", svcName); err != nil {
 		return err
 	}
 
 	fmt.Println()
-	fmt.Println("✓ SelfTunnel service installed successfully!")
+	fmt.Printf("✓ SelfTunnel service '%s' installed successfully!\n", svcName)
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  selftunnel service start    - Start the service")
-	fmt.Println("  selftunnel service stop     - Stop the service")
-	fmt.Println("  selftunnel service status   - Check service status")
-	fmt.Println("  selftunnel service logs -f  - Follow service logs")
+	fmt.Printf("  selftunnel service start --name %s    - Start the service\n", getInstanceName(svcName))
+	fmt.Printf("  selftunnel service stop --name %s     - Stop the service\n", getInstanceName(svcName))
+	fmt.Printf("  selftunnel service status --name %s   - Check service status\n", getInstanceName(svcName))
+	fmt.Printf("  selftunnel service logs --name %s -f  - Follow service logs\n", getInstanceName(svcName))
 	fmt.Println()
 	fmt.Println("Or use systemctl directly:")
-	fmt.Printf("  sudo systemctl start %s\n", serviceName)
-	fmt.Printf("  sudo systemctl status %s\n", serviceName)
-	fmt.Printf("  sudo journalctl -u %s -f\n", serviceName)
+	fmt.Printf("  sudo systemctl start %s\n", svcName)
+	fmt.Printf("  sudo systemctl status %s\n", svcName)
+	fmt.Printf("  sudo journalctl -u %s -f\n", svcName)
 
 	return nil
 }
 
-func uninstallLinuxService() error {
+func uninstallLinuxService(svcName string) error {
 	// Check if running as root
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("this command must be run as root (use sudo)")
 	}
 
-	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
+	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", svcName)
 
 	// Check if service exists
 	if _, err := os.Stat(servicePath); os.IsNotExist(err) {
-		fmt.Println("Service is not installed.")
+		fmt.Printf("Service '%s' is not installed.\n", svcName)
 		return nil
 	}
 
 	// Stop service if running
 	fmt.Println("Stopping service...")
-	runCommand("systemctl", "stop", serviceName)
+	runCommand("systemctl", "stop", svcName)
 
 	// Disable service
 	fmt.Println("Disabling service...")
-	runCommand("systemctl", "disable", serviceName)
+	runCommand("systemctl", "disable", svcName)
 
 	// Remove service file
 	fmt.Printf("Removing %s...\n", servicePath)
@@ -283,15 +347,16 @@ func uninstallLinuxService() error {
 	}
 
 	fmt.Println()
-	fmt.Println("✓ SelfTunnel service uninstalled successfully!")
+	fmt.Printf("✓ SelfTunnel service '%s' uninstalled successfully!\n", svcName)
 	fmt.Println()
-	fmt.Println("Note: The binary at /usr/local/bin/selftunnel was not removed.")
-	fmt.Println("      To remove it, run: sudo rm /usr/local/bin/selftunnel")
+	targetPath := fmt.Sprintf("/usr/local/bin/%s", svcName)
+	fmt.Printf("Note: The binary at %s was not removed.\n", targetPath)
+	fmt.Printf("      To remove it, run: sudo rm %s\n", targetPath)
 
 	return nil
 }
 
-func installWindowsService() error {
+func installWindowsService(svcName string) error {
 	// Get the path to the current executable
 	execPath, err := os.Executable()
 	if err != nil {
@@ -303,65 +368,78 @@ func installWindowsService() error {
 	}
 
 	// Create the service using sc.exe
-	fmt.Println("Creating Windows service...")
+	fmt.Printf("Creating Windows service '%s'...\n", svcName)
 
 	// sc create selftunnel binPath= "C:\path\to\selftunnel.exe up" start= auto
 	binPath := fmt.Sprintf("\"%s\" up", execPath)
 
-	cmd := exec.Command("sc", "create", serviceName,
+	displayName := serviceDescription
+	if svcName != defaultServiceName {
+		displayName = fmt.Sprintf("%s (%s)", serviceDescription, svcName)
+	}
+
+	cmd := exec.Command("sc", "create", svcName,
 		"binPath=", binPath,
 		"start=", "auto",
-		"DisplayName=", serviceDescription)
+		"DisplayName=", displayName)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(output), "1073") {
-			fmt.Println("Service already exists. To reinstall, run 'selftunnel service uninstall' first.")
+			fmt.Printf("Service '%s' already exists. To reinstall, run 'selftunnel service uninstall --name %s' first.\n", svcName, getInstanceName(svcName))
 			return nil
 		}
 		return fmt.Errorf("failed to create service: %s", string(output))
 	}
 
 	// Set description
-	exec.Command("sc", "description", serviceName, serviceDescription).Run()
+	exec.Command("sc", "description", svcName, serviceDescription).Run()
 
 	// Configure failure recovery
-	exec.Command("sc", "failure", serviceName, "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
+	exec.Command("sc", "failure", svcName, "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
 
 	fmt.Println()
-	fmt.Println("✓ SelfTunnel service installed successfully!")
+	fmt.Printf("✓ SelfTunnel service '%s' installed successfully!\n", svcName)
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  selftunnel service start   - Start the service")
-	fmt.Println("  selftunnel service stop    - Stop the service")
-	fmt.Println("  selftunnel service status  - Check service status")
+	fmt.Printf("  selftunnel service start --name %s   - Start the service\n", getInstanceName(svcName))
+	fmt.Printf("  selftunnel service stop --name %s    - Stop the service\n", getInstanceName(svcName))
+	fmt.Printf("  selftunnel service status --name %s  - Check service status\n", getInstanceName(svcName))
 	fmt.Println()
 	fmt.Println("Or use Windows Services (services.msc) to manage the service.")
 
 	return nil
 }
 
-func uninstallWindowsService() error {
+func uninstallWindowsService(svcName string) error {
 	// Stop service first
 	fmt.Println("Stopping service...")
-	exec.Command("sc", "stop", serviceName).Run()
+	exec.Command("sc", "stop", svcName).Run()
 
 	// Delete service
 	fmt.Println("Removing service...")
-	cmd := exec.Command("sc", "delete", serviceName)
+	cmd := exec.Command("sc", "delete", svcName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(output), "1060") {
-			fmt.Println("Service does not exist.")
+			fmt.Printf("Service '%s' does not exist.\n", svcName)
 			return nil
 		}
 		return fmt.Errorf("failed to delete service: %s", string(output))
 	}
 
 	fmt.Println()
-	fmt.Println("✓ SelfTunnel service uninstalled successfully!")
+	fmt.Printf("✓ SelfTunnel service '%s' uninstalled successfully!\n", svcName)
 
 	return nil
+}
+
+// getInstanceName returns the instance name from full service name
+func getInstanceName(svcName string) string {
+	if svcName == defaultServiceName {
+		return ""
+	}
+	return strings.TrimPrefix(svcName, defaultServiceName+"-")
 }
 
 func runCommand(name string, args ...string) error {
