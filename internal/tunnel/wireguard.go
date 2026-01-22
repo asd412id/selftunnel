@@ -214,6 +214,26 @@ func (wg *WireGuardTunnel) UpdatePeerEndpoint(publicKey [crypto.KeySize]byte, en
 	return nil
 }
 
+// UpdatePeerEndpointByKey updates a peer's endpoint using base64 public key string
+func (wg *WireGuardTunnel) UpdatePeerEndpointByKey(publicKeyB64 string, endpoint string) error {
+	pubKey, err := crypto.FromBase64(publicKeyB64)
+	if err != nil {
+		return fmt.Errorf("invalid public key: %w", err)
+	}
+	return wg.UpdatePeerEndpoint(pubKey, endpoint)
+}
+
+// EnableRelayFallback enables relay fallback for a peer (used when direct connection is lost)
+func (wg *WireGuardTunnel) EnableRelayFallback(publicKeyB64 string) {
+	wg.peersMu.Lock()
+	if peer, ok := wg.peers[publicKeyB64]; ok {
+		peer.mu.Lock()
+		peer.relayFallback = true
+		peer.mu.Unlock()
+	}
+	wg.peersMu.Unlock()
+}
+
 // Start starts the WireGuard tunnel
 func (wg *WireGuardTunnel) Start() error {
 	// Start TUN reader
@@ -403,10 +423,11 @@ func (wg *WireGuardTunnel) checkPeerHealth() {
 
 		needReconnect := false
 
-		// If we have a direct endpoint but haven't received data in 30+ seconds,
+		// If we have a direct endpoint but haven't received data in 15+ seconds,
 		// enable relay fallback (connection might be broken)
+		// Reduced from 30s to 15s for faster recovery on IP changes
 		if hasEndpoint && !wasUsingRelay && !lastSeen.IsZero() {
-			if time.Since(lastSeen) > 30*time.Second {
+			if time.Since(lastSeen) > 15*time.Second {
 				peer.relayFallback = true
 				needReconnect = true
 				log.Printf("[Health] Peer %s direct connection stale (last seen %v ago), enabling relay fallback", peerKey[:16], time.Since(lastSeen))

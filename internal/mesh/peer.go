@@ -261,11 +261,25 @@ func (pm *PeerManager) Close() {
 	pm.cancel()
 }
 
-// SetEndpoints safely updates a peer's endpoints
-func (p *Peer) SetEndpoints(endpoints []string) {
+// SetEndpoints safely updates a peer's endpoints and returns true if primary endpoint changed
+func (p *Peer) SetEndpoints(endpoints []string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Check if primary endpoint changed (first endpoint is most important)
+	oldPrimary := ""
+	newPrimary := ""
+	if len(p.Endpoints) > 0 {
+		oldPrimary = p.Endpoints[0]
+	}
+	if len(endpoints) > 0 {
+		newPrimary = endpoints[0]
+	}
+
 	p.Endpoints = endpoints
+
+	// Return true if primary endpoint changed and both are non-empty
+	return oldPrimary != "" && newPrimary != "" && oldPrimary != newPrimary
 }
 
 // GetEndpoints safely gets a peer's endpoints

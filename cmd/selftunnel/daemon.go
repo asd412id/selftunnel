@@ -505,7 +505,38 @@ func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 			}
 		} else {
 			// Update existing peer's endpoints if changed
-			existing.SetEndpoints(peer.Endpoints)
+			endpointChanged := existing.SetEndpoints(peer.Endpoints)
+
+			// If primary endpoint changed and peer was connected, trigger reconnect
+			// This handles IP change scenarios (NAT rebinding, network switch, etc.)
+			if endpointChanged {
+				currentState := existing.GetState()
+				lastSeen := existing.GetLastSeen()
+
+				// Only trigger reconnect if connection seems stale (no data in 5+ seconds)
+				// This avoids unnecessary reconnects when connection is still working
+				if currentState == mesh.PeerStateConnected && time.Since(lastSeen) > 5*time.Second {
+					log.Printf("[Endpoint] Peer %s endpoint changed and connection stale, triggering reconnect", existing.Name)
+					existing.SetState(mesh.PeerStateConnecting)
+
+					// Enable relay fallback and update WireGuard endpoint immediately
+					if d.wg != nil && len(peer.Endpoints) > 0 {
+						d.wg.EnableRelayFallback(existing.PublicKey)
+						d.wg.UpdatePeerEndpointByKey(existing.PublicKey, peer.Endpoints[0])
+					}
+
+					// Attempt new direct connection
+					if d.discovery != nil {
+						go d.discovery.ConnectToPeer(peer.PublicKey)
+					}
+				} else if currentState != mesh.PeerStateConnected {
+					// Peer not connected, update endpoint and try to connect
+					log.Printf("[Endpoint] Peer %s endpoint changed (state: %v), updating", existing.Name, currentState)
+					if d.wg != nil && len(peer.Endpoints) > 0 {
+						d.wg.UpdatePeerEndpointByKey(existing.PublicKey, peer.Endpoints[0])
+					}
+				}
+			}
 		}
 	}
 }
