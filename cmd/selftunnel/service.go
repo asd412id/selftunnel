@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/kardianos/service"
 	"github.com/selftunnel/selftunnel/internal/config"
 	"github.com/selftunnel/selftunnel/internal/crypto"
 	"github.com/selftunnel/selftunnel/internal/mesh"
@@ -489,13 +490,12 @@ func installWindowsService(svcName, instanceName string) error {
 		return fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	// Create the service using sc.exe
-	fmt.Printf("Creating Windows service '%s'...\n", svcName)
+	fmt.Printf("Installing Windows service '%s'...\n", svcName)
 
-	// Build binPath with instance name if needed
-	binPath := fmt.Sprintf("\"%s\" up", execPath)
+	// Build arguments for the service
+	args := []string{"up"}
 	if instanceName != "" {
-		binPath = fmt.Sprintf("\"%s\" up --instance %s", execPath, instanceName)
+		args = append(args, "--instance", instanceName)
 	}
 
 	displayName := serviceDescription
@@ -503,33 +503,44 @@ func installWindowsService(svcName, instanceName string) error {
 		displayName = fmt.Sprintf("%s (%s)", serviceDescription, svcName)
 	}
 
-	cmd := exec.Command("sc", "create", svcName,
-		"binPath=", binPath,
-		"start=", "auto",
-		"DisplayName=", displayName)
+	// Use kardianos/service for proper Windows service support
+	svcConfig := &service.Config{
+		Name:        svcName,
+		DisplayName: displayName,
+		Description: "SelfTunnel P2P Mesh VPN - Secure peer-to-peer connections",
+		Executable:  execPath,
+		Arguments:   args,
+	}
 
-	output, err := cmd.CombinedOutput()
+	prg := &program{instanceName: instanceName}
+	s, err := service.New(prg, svcConfig)
 	if err != nil {
-		if strings.Contains(string(output), "1073") {
+		return fmt.Errorf("failed to create service: %w", err)
+	}
+
+	// Install the service
+	err = s.Install()
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
 			fmt.Printf("Service '%s' already exists. To reinstall, run 'selftunnel service uninstall --name %s' first.\n", svcName, getInstanceName(svcName))
 			return nil
 		}
-		return fmt.Errorf("failed to create service: %s", string(output))
+		return fmt.Errorf("failed to install service: %w", err)
 	}
-
-	// Set description
-	exec.Command("sc", "description", svcName, serviceDescription).Run()
-
-	// Configure failure recovery
-	exec.Command("sc", "failure", svcName, "reset=", "86400", "actions=", "restart/5000/restart/10000/restart/30000").Run()
 
 	fmt.Println()
 	fmt.Printf("✓ SelfTunnel service '%s' installed successfully!\n", svcName)
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Printf("  selftunnel service start --name %s   - Start the service\n", getInstanceName(svcName))
-	fmt.Printf("  selftunnel service stop --name %s    - Stop the service\n", getInstanceName(svcName))
-	fmt.Printf("  selftunnel service status --name %s  - Check service status\n", getInstanceName(svcName))
+	if instanceName != "" {
+		fmt.Printf("  selftunnel service start --name %s   - Start the service\n", instanceName)
+		fmt.Printf("  selftunnel service stop --name %s    - Stop the service\n", instanceName)
+		fmt.Printf("  selftunnel service status --name %s  - Check service status\n", instanceName)
+	} else {
+		fmt.Println("  selftunnel service start   - Start the service")
+		fmt.Println("  selftunnel service stop    - Stop the service")
+		fmt.Println("  selftunnel service status  - Check service status")
+	}
 	fmt.Println()
 	fmt.Println("Or use Windows Services (services.msc) to manage the service.")
 
@@ -537,20 +548,31 @@ func installWindowsService(svcName, instanceName string) error {
 }
 
 func uninstallWindowsService(svcName string) error {
+	fmt.Printf("Uninstalling Windows service '%s'...\n", svcName)
+
+	// Use kardianos/service for proper Windows service support
+	svcConfig := &service.Config{
+		Name: svcName,
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create service: %w", err)
+	}
+
 	// Stop service first
 	fmt.Println("Stopping service...")
-	exec.Command("sc", "stop", svcName).Run()
+	s.Stop()
 
-	// Delete service
-	fmt.Println("Removing service...")
-	cmd := exec.Command("sc", "delete", svcName)
-	output, err := cmd.CombinedOutput()
+	// Uninstall the service
+	err = s.Uninstall()
 	if err != nil {
-		if strings.Contains(string(output), "1060") {
-			fmt.Printf("Service '%s' does not exist.\n", svcName)
+		if strings.Contains(err.Error(), "not installed") || strings.Contains(err.Error(), "does not exist") {
+			fmt.Printf("Service '%s' is not installed.\n", svcName)
 			return nil
 		}
-		return fmt.Errorf("failed to delete service: %s", string(output))
+		return fmt.Errorf("failed to uninstall service: %w", err)
 	}
 
 	fmt.Println()

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kardianos/service"
 	"github.com/selftunnel/selftunnel/internal/config"
 	"github.com/selftunnel/selftunnel/internal/crypto"
 	"github.com/selftunnel/selftunnel/internal/mesh"
@@ -28,6 +29,63 @@ type Daemon struct {
 	holePuncher *nat.HolePuncher
 	ctx         context.Context
 	cancel      context.CancelFunc
+}
+
+// program implements service.Interface for Windows Service support
+type program struct {
+	daemon       *Daemon
+	instanceName string
+}
+
+func (p *program) Start(s service.Service) error {
+	log.Println("Service starting...")
+	go p.run()
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	log.Println("Service stopping...")
+	if p.daemon != nil {
+		p.daemon.Stop()
+	}
+	return nil
+}
+
+func (p *program) run() {
+	cfg, err := config.LoadForInstance(p.instanceName)
+	if err != nil {
+		log.Printf("Failed to load config: %v", err)
+		return
+	}
+
+	if cfg.NetworkID == "" || cfg.NetworkSecret == "" {
+		log.Println("Not configured. Run 'selftunnel init' or 'selftunnel join' first")
+		return
+	}
+
+	daemon, err := NewDaemon(cfg)
+	if err != nil {
+		log.Printf("Failed to create daemon: %v", err)
+		return
+	}
+	p.daemon = daemon
+
+	if err := daemon.Start(); err != nil {
+		log.Printf("Failed to start daemon: %v", err)
+		return
+	}
+
+	// Print status periodically
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-daemon.ctx.Done():
+			return
+		case <-ticker.C:
+			daemon.Status()
+		}
+	}
 }
 
 func NewDaemon(cfg *config.Config) (*Daemon, error) {
@@ -195,17 +253,17 @@ func (d *Daemon) Stop() {
 }
 
 func (d *Daemon) Status() {
-	fmt.Println("Daemon Status:")
-	fmt.Printf("  Node: %s\n", d.cfg.NodeName)
-	fmt.Printf("  Virtual IP: %s\n", d.cfg.VirtualIP)
-	fmt.Printf("  Network: %s\n", d.cfg.NetworkID)
+	log.Println("Daemon Status:")
+	log.Printf("  Node: %s", d.cfg.NodeName)
+	log.Printf("  Virtual IP: %s", d.cfg.VirtualIP)
+	log.Printf("  Network: %s", d.cfg.NetworkID)
 
 	if d.tun != nil {
-		fmt.Printf("  TUN Interface: %s\n", d.tun.Name())
+		log.Printf("  TUN Interface: %s", d.tun.Name())
 	}
 
 	peers := d.peerManager.GetAllPeers()
-	fmt.Printf("  Peers: %d\n", len(peers))
+	log.Printf("  Peers: %d", len(peers))
 	for _, p := range peers {
 		state := "disconnected"
 		if p.State == mesh.PeerStateConnected {
@@ -213,11 +271,45 @@ func (d *Daemon) Status() {
 		} else if p.State == mesh.PeerStateConnecting {
 			state = "connecting"
 		}
-		fmt.Printf("    - %s (%s): %s\n", p.Name, p.VirtualIP, state)
+		log.Printf("    - %s (%s): %s", p.Name, p.VirtualIP, state)
 	}
 }
 
+// RunDaemon runs the daemon, supporting both interactive and service modes
 func RunDaemon(instanceName string) error {
+	// Create service config
+	svcName := "selftunnel"
+	if instanceName != "" {
+		svcName = fmt.Sprintf("selftunnel-%s", instanceName)
+	}
+
+	svcConfig := &service.Config{
+		Name:        svcName,
+		DisplayName: "SelfTunnel P2P Mesh VPN",
+		Description: "Peer-to-peer mesh VPN service",
+	}
+
+	prg := &program{
+		instanceName: instanceName,
+	}
+
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create service: %w", err)
+	}
+
+	// Check if running interactively
+	if service.Interactive() {
+		// Running from command line, not as service
+		return runInteractive(instanceName)
+	}
+
+	// Running as service
+	return s.Run()
+}
+
+// runInteractive runs the daemon in interactive/foreground mode
+func runInteractive(instanceName string) error {
 	cfg, err := config.LoadForInstance(instanceName)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
