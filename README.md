@@ -412,13 +412,12 @@ sudo ./install-selftunnel.sh "YOUR_NETWORK_ID" "YOUR_NETWORK_SECRET" "my-ubuntu-
 |----------|--------|-------|
 | Linux | ✅ Full | Recommended for servers |
 | macOS | ✅ Full | Requires sudo |
-| Windows | ⚠️ Partial | Requires wintun driver |
+| Windows | ✅ Full | WinTUN driver embedded (auto-extracted) |
 
 ## Limitations
 
 - **Symmetric NAT**: May fail to establish direct connection (fallback to relay planned)
 - **Strict Firewalls**: Some corporate firewalls may block UDP traffic
-- **Windows**: Requires additional TUN driver (wintun)
 
 ## Troubleshooting
 
