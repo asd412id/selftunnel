@@ -22,11 +22,32 @@ Internet                         VPS
 
 ## Quick Start
 
-### Option 1: Docker (Recommended)
+### Option 1: Docker + Cloudflare Tunnel (Recommended)
 
 ```bash
 # Clone repository
 git clone https://github.com/asd412id/selftunnel.git
+cd selftunnel/deploy/docker
+
+# Create .env with your Cloudflare Tunnel token
+cp .env.example .env
+nano .env  # Edit TUNNEL_TOKEN
+
+# Start with Cloudflare Tunnel
+docker compose -f compose.tunnel.yaml up -d
+```
+
+**Getting Cloudflare Tunnel Token:**
+1. Go to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com)
+2. Access > Tunnels > Create a tunnel
+3. Name your tunnel (e.g., `selftunnel-signaling`)
+4. Select Docker as environment
+5. Copy the token from the command (the long string after `--token`)
+6. Configure public hostname: `signaling.yourdomain.com` → `http://signaling-server:8080`
+
+### Option 2: Docker (HTTP/HTTPS)
+
+```bash
 cd selftunnel/deploy/docker
 
 # Basic (HTTP only, port 8080)
@@ -37,7 +58,7 @@ docker compose up -d
 docker compose -f compose.https.yaml up -d
 ```
 
-### Option 2: Systemd Service
+### Option 3: Systemd Service
 
 ```bash
 # One-liner install
@@ -55,27 +76,76 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now selftunnel-signaling
 ```
 
-### Option 3: Cloudflare Tunnel (No Public IP Needed)
-
-```bash
-# Install signaling server first (Option 2)
-# Then expose via Cloudflare Tunnel
-
-cloudflared tunnel --url http://localhost:8080
-# This gives you a random URL like https://random-words.trycloudflare.com
-
-# For production, create named tunnel:
-cloudflared tunnel login
-cloudflared tunnel create selftunnel
-cloudflared tunnel route dns selftunnel signaling.yourdomain.com
-cloudflared tunnel run selftunnel
-```
-
 ---
 
 ## Detailed Setup
 
-### Docker Deployment
+### Docker + Cloudflare Tunnel (Recommended)
+
+This is the easiest way to deploy - no need to manage SSL certificates or open firewall ports.
+
+#### Step 1: Create Cloudflare Tunnel
+
+1. Login to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com)
+2. Go to **Access** > **Tunnels**
+3. Click **Create a tunnel**
+4. Choose **Cloudflared** connector
+5. Name your tunnel: `selftunnel-signaling`
+6. Click **Save tunnel**
+7. Select **Docker** as your environment
+8. Copy the token (long string after `--token`)
+
+#### Step 2: Configure Public Hostname
+
+In the tunnel configuration:
+- **Public hostname**: `signaling.yourdomain.com`
+- **Service**: `http://signaling-server:8080`
+
+> Note: Use `signaling-server` (container name) not `localhost`
+
+#### Step 3: Deploy
+
+```bash
+cd deploy/docker
+
+# Create .env file
+cp .env.example .env
+
+# Edit and paste your token
+nano .env
+# TUNNEL_TOKEN=eyJhIjoixxxxx...
+
+# Start services
+docker compose -f compose.tunnel.yaml up -d
+
+# Check logs
+docker compose -f compose.tunnel.yaml logs -f
+
+# Check health
+curl https://signaling.yourdomain.com/health
+```
+
+#### Manage
+
+```bash
+# Stop
+docker compose -f compose.tunnel.yaml down
+
+# Restart
+docker compose -f compose.tunnel.yaml restart
+
+# Update
+docker compose -f compose.tunnel.yaml pull
+docker compose -f compose.tunnel.yaml up -d
+
+# View logs
+docker compose -f compose.tunnel.yaml logs -f cloudflared
+docker compose -f compose.tunnel.yaml logs -f signaling-server
+```
+
+---
+
+### Docker Deployment (Without Cloudflare Tunnel)
 
 #### Basic Setup (HTTP)
 
