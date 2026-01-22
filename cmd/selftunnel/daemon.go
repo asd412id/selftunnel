@@ -413,6 +413,7 @@ func (d *Daemon) connectRelay() {
 		log.Printf("Warning: Could not connect to relay: %v", err)
 	} else {
 		log.Println("Connected to relay server (fallback enabled)")
+		d.relayClient.EnableAutoReconnect(true) // Enable auto-reconnect
 		d.wg.SetRelay(d.relayClient)
 		d.discovery.SetRelayClient(d.relayClient) // Enable coordinated hole punching
 	}
@@ -440,7 +441,7 @@ func (d *Daemon) Stop() {
 		}
 
 		if d.relayClient != nil {
-			d.relayClient.Close()
+			d.relayClient.CloseAndStop()
 		}
 
 		if d.wg != nil {

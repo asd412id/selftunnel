@@ -52,8 +52,11 @@ type Client struct {
 	sendCh chan []byte
 	recvCh chan *RelayMessage
 
-	onData  func(from string, data []byte)
-	onPunch func(from string, endpoints []string) // callback when peer wants to punch
+	onData       func(from string, data []byte)
+	onPunch      func(from string, endpoints []string) // callback when peer wants to punch
+	onDisconnect func()                                // callback when relay disconnects
+
+	autoReconnect bool // enable auto-reconnect
 
 	ctx struct {
 		done chan struct{}
@@ -81,6 +84,16 @@ func (c *Client) SetDataHandler(handler func(from string, data []byte)) {
 // SetPunchHandler sets the callback for punch coordination
 func (c *Client) SetPunchHandler(handler func(from string, endpoints []string)) {
 	c.onPunch = handler
+}
+
+// SetDisconnectHandler sets the callback for when relay disconnects
+func (c *Client) SetDisconnectHandler(handler func()) {
+	c.onDisconnect = handler
+}
+
+// EnableAutoReconnect enables automatic reconnection when relay disconnects
+func (c *Client) EnableAutoReconnect(enable bool) {
+	c.autoReconnect = enable
 }
 
 // RequestPunch sends a punch request to a peer via relay
@@ -224,13 +237,25 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-// Close closes the relay connection
+// Close closes the relay connection (does not stop auto-reconnect)
 func (c *Client) Close() {
+	c.closeInternal(false)
+}
+
+// CloseAndStop closes the relay connection and stops auto-reconnect
+func (c *Client) CloseAndStop() {
+	c.autoReconnect = false
+	c.closeInternal(true)
+}
+
+func (c *Client) closeInternal(stopAutoReconnect bool) {
 	// Signal goroutines to stop
 	select {
 	case <-c.ctx.done:
 		// Already closed
-		return
+		if !stopAutoReconnect {
+			return
+		}
 	default:
 		close(c.ctx.done)
 	}
@@ -238,6 +263,7 @@ func (c *Client) Close() {
 	c.connMu.Lock()
 	if c.conn != nil {
 		c.conn.Close()
+		c.conn = nil
 	}
 	c.connected = false
 	c.connMu.Unlock()
@@ -340,6 +366,16 @@ func (c *Client) reader() {
 			c.connMu.Lock()
 			c.connected = false
 			c.connMu.Unlock()
+
+			// Notify about disconnect
+			if c.onDisconnect != nil {
+				go c.onDisconnect()
+			}
+
+			// Trigger auto-reconnect if enabled
+			if c.autoReconnect {
+				go c.autoReconnectLoop()
+			}
 			return
 		}
 
@@ -429,4 +465,40 @@ func (c *Client) Reconnect() error {
 	c.Close()
 	time.Sleep(time.Second)
 	return c.Connect()
+}
+
+// autoReconnectLoop attempts to reconnect with exponential backoff
+func (c *Client) autoReconnectLoop() {
+	backoff := 2 * time.Second
+	maxBackoff := 60 * time.Second
+	attempt := 0
+
+	for {
+		select {
+		case <-c.ctx.done:
+			return
+		default:
+		}
+
+		attempt++
+		log.Printf("[Relay] Attempting reconnect (attempt %d)...", attempt)
+
+		// Reset context for new connection
+		c.ctx.done = make(chan struct{})
+
+		if err := c.Connect(); err != nil {
+			log.Printf("[Relay] Reconnect failed: %v", err)
+
+			// Exponential backoff
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		log.Printf("[Relay] Reconnected successfully after %d attempts", attempt)
+		return
+	}
 }
