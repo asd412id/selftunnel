@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/selftunnel/selftunnel/internal/tunnel/wintun"
 	"github.com/songgao/water"
 )
 
@@ -27,13 +28,16 @@ type TUNConfig struct {
 }
 
 func NewTUN(cfg TUNConfig) (*TUNDevice, error) {
+	// On Windows, ensure WinTUN is available
+	if runtime.GOOS == "windows" {
+		if err := wintun.EnsureWinTUN(); err != nil {
+			return nil, fmt.Errorf("failed to initialize WinTUN: %w", err)
+		}
+	}
+
 	config := water.Config{
 		DeviceType: water.TUN,
 	}
-
-	// Set interface name based on platform (platform-specific config)
-	// Note: On Windows, the water library uses a different mechanism
-	// On Linux, we can set the name via PlatformSpecificParams
 
 	iface, err := water.New(config)
 	if err != nil {
