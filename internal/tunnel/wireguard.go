@@ -423,11 +423,11 @@ func (wg *WireGuardTunnel) checkPeerHealth() {
 
 		needReconnect := false
 
-		// If we have a direct endpoint but haven't received data in 15+ seconds,
+		// If we have a direct endpoint but haven't received data in 5+ seconds,
 		// enable relay fallback (connection might be broken)
-		// Reduced from 30s to 15s for faster recovery on IP changes
+		// Reduced from 30s to 5s for faster recovery on IP changes
 		if hasEndpoint && !wasUsingRelay && !lastSeen.IsZero() {
-			if time.Since(lastSeen) > 15*time.Second {
+			if time.Since(lastSeen) > 5*time.Second {
 				peer.relayFallback = true
 				needReconnect = true
 				log.Printf("[Health] Peer %s direct connection stale (last seen %v ago), enabling relay fallback", peerKey[:16], time.Since(lastSeen))

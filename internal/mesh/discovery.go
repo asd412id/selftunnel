@@ -126,7 +126,7 @@ func (d *Discovery) maintenanceLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	retryTicker := time.NewTicker(30 * time.Second) // Retry direct connection every 30s (reduced from 60s)
+	retryTicker := time.NewTicker(3 * time.Second) // Retry direct connection every 3s (reduced from 60s)
 	defer retryTicker.Stop()
 
 	for {
@@ -177,9 +177,9 @@ func (d *Discovery) retryDirectConnections() {
 		// IMPORTANT: Don't disturb working connections!
 		// Only retry if:
 		// 1. Peer is disconnected
-		// 2. Peer is stuck in connecting for too long (>30s)
-		// 3. Peer is connected but hasn't been seen in >30s (stale connection)
-		// Reduced from 60s to 30s for faster recovery
+		// 2. Peer is stuck in connecting for too long (>5s)
+		// 3. Peer is connected but hasn't been seen in >5s (stale connection)
+		// Reduced from 60s to 5s for faster recovery
 		shouldRetry := false
 		reason := ""
 
@@ -188,14 +188,14 @@ func (d *Discovery) retryDirectConnections() {
 			shouldRetry = true
 			reason = "disconnected"
 		case PeerStateConnecting:
-			// Only retry if stuck for more than 30 seconds
-			if time.Since(lastSeen) > 30*time.Second {
+			// Only retry if stuck for more than 5 seconds
+			if time.Since(lastSeen) > 5*time.Second {
 				shouldRetry = true
 				reason = fmt.Sprintf("stuck connecting for %v", time.Since(lastSeen))
 			}
 		case PeerStateConnected:
-			// Only retry if truly stale (>30s without activity)
-			if time.Since(lastSeen) > 30*time.Second {
+			// Only retry if truly stale (>5s without activity)
+			if time.Since(lastSeen) > 5*time.Second {
 				shouldRetry = true
 				reason = fmt.Sprintf("stale connection (last seen %v ago)", time.Since(lastSeen))
 			}
