@@ -111,6 +111,12 @@ ssh user@10.99.0.2
 | `selftunnel peers` | List all peers in the network |
 | `selftunnel leave` | Leave the current network |
 | `selftunnel generate keys` | Generate a new key pair |
+| `selftunnel service install` | Install as system service |
+| `selftunnel service uninstall` | Remove system service |
+| `selftunnel service start` | Start the service |
+| `selftunnel service stop` | Stop the service |
+| `selftunnel service status` | Show service status |
+| `selftunnel service logs` | Show service logs |
 
 ## Configuration
 
@@ -148,6 +154,10 @@ sudo mv selftunnel-linux-amd64 /usr/local/bin/selftunnel
 
 # Join network
 selftunnel join --network "YOUR_NETWORK_ID" --secret "YOUR_SECRET" --name "ubuntu-server"
+
+# Install as service (recommended)
+sudo selftunnel service install
+sudo selftunnel service start
 ```
 
 ### Method 2: Build from Source
@@ -162,9 +172,37 @@ git clone https://github.com/asd412id/selftunnel.git
 cd selftunnel
 go build -o selftunnel ./cmd/selftunnel
 sudo mv selftunnel /usr/local/bin/
+
+# Install and start service
+sudo selftunnel service install
+sudo selftunnel service start
 ```
 
-### Setup Systemd Service (Autostart)
+### Service Management
+
+SelfTunnel includes built-in service management commands (similar to cloudflared):
+
+```bash
+# Install service (creates systemd unit and enables autostart)
+sudo selftunnel service install
+
+# Uninstall service
+sudo selftunnel service uninstall
+
+# Start/Stop/Restart
+sudo selftunnel service start
+sudo selftunnel service stop
+sudo selftunnel service restart
+
+# Check status
+sudo selftunnel service status
+
+# View logs (with follow mode)
+sudo selftunnel service logs -f
+sudo selftunnel service logs -n 100  # last 100 lines
+```
+
+### Manual Systemd Setup (Alternative)
 
 1. **Create systemd service file:**
 

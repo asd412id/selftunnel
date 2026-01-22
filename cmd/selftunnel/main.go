@@ -43,6 +43,7 @@ connect multiple devices without requiring a central server for traffic relay.`,
 		peersCmd(),
 		generateCmd(),
 		upCmd(),
+		serviceCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
