@@ -12,6 +12,8 @@ const (
 	DefaultKeepalive    = 25
 	DefaultVirtualCIDR  = "10.99.0.0/24"
 	DefaultSignalingURL = "https://selftunnel-signaling.asdar-binsyam.workers.dev"
+	DefaultDNSPort      = 5353
+	DefaultDNSSuffix    = "selftunnel"
 )
 
 type Config struct {
@@ -36,6 +38,11 @@ type Config struct {
 
 	// STUN servers for NAT traversal
 	STUNServers []string `json:"stun_servers"`
+
+	// DNS settings
+	DNSEnabled bool   `json:"dns_enabled"`
+	DNSPort    int    `json:"dns_port"`
+	DNSSuffix  string `json:"dns_suffix"`
 }
 
 func DefaultConfig() *Config {
@@ -50,6 +57,9 @@ func DefaultConfig() *Config {
 			"stun:stun1.l.google.com:19302",
 			"stun:stun.cloudflare.com:3478",
 		},
+		DNSEnabled: true,
+		DNSPort:    DefaultDNSPort,
+		DNSSuffix:  DefaultDNSSuffix,
 	}
 }
 

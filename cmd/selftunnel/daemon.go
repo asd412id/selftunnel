@@ -12,6 +12,7 @@ import (
 	"github.com/kardianos/service"
 	"github.com/selftunnel/selftunnel/internal/config"
 	"github.com/selftunnel/selftunnel/internal/crypto"
+	"github.com/selftunnel/selftunnel/internal/dns"
 	"github.com/selftunnel/selftunnel/internal/mesh"
 	"github.com/selftunnel/selftunnel/internal/nat"
 	"github.com/selftunnel/selftunnel/internal/signaling"
@@ -27,6 +28,7 @@ type Daemon struct {
 	discovery   *mesh.Discovery
 	signaling   *signaling.Client
 	holePuncher *nat.HolePuncher
+	dnsServer   *dns.Server
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -221,6 +223,19 @@ func (d *Daemon) Start() error {
 	d.signaling.Start()
 	d.discovery.Start()
 
+	// Start DNS server if enabled
+	if d.cfg.DNSEnabled {
+		resolver := dns.NewMeshResolver(d.peerManager)
+		dnsConfig := dns.Config{
+			Port:   d.cfg.DNSPort,
+			Suffix: d.cfg.DNSSuffix,
+		}
+		d.dnsServer = dns.NewServer(resolver, dnsConfig)
+		if err := d.dnsServer.Start(); err != nil {
+			log.Printf("Warning: Could not start DNS server: %v", err)
+		}
+	}
+
 	log.Println("SelfTunnel daemon started successfully")
 	return nil
 }
@@ -228,6 +243,10 @@ func (d *Daemon) Start() error {
 func (d *Daemon) Stop() {
 	log.Println("Stopping SelfTunnel daemon...")
 	d.cancel()
+
+	if d.dnsServer != nil {
+		d.dnsServer.Stop()
+	}
 
 	if d.discovery != nil {
 		d.discovery.Stop()
@@ -260,6 +279,10 @@ func (d *Daemon) Status() {
 
 	if d.tun != nil {
 		log.Printf("  TUN Interface: %s", d.tun.Name())
+	}
+
+	if d.dnsServer != nil {
+		log.Printf("  DNS: %s.%s -> %s (port %d)", d.cfg.NodeName, d.cfg.DNSSuffix, d.cfg.VirtualIP, d.cfg.DNSPort)
 	}
 
 	peers := d.peerManager.GetAllPeers()

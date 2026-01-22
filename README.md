@@ -10,6 +10,7 @@ A peer-to-peer mesh VPN that allows you to securely connect multiple devices wit
 - **WireGuard-based Encryption**: Industry-standard VPN encryption
 - **Cloudflare Workers Signaling**: Free serverless signaling server
 - **Full Mesh Topology**: Every node can connect to every other node
+- **Local DNS Resolution**: Resolve peer names to virtual IPs (e.g., `my-server.selftunnel`)
 
 ## Architecture
 
@@ -124,6 +125,93 @@ sudo selftunnel up
 ```bash
 # From your laptop, SSH to server using virtual IP
 ssh user@10.99.0.2
+
+# Or using peer DNS name (requires DNS setup, see below)
+ssh user@my-server.selftunnel
+```
+
+## DNS Resolution
+
+SelfTunnel includes a built-in DNS server that resolves peer names to their virtual IPs. This allows you to connect to peers using friendly names instead of remembering IP addresses.
+
+### How It Works
+
+When the daemon starts, it runs a DNS server on port 5353 (configurable). It resolves queries for `<peer-name>.selftunnel` to the peer's virtual IP address.
+
+For example, if you have a peer named `my-server` with virtual IP `10.99.0.2`:
+- Query: `my-server.selftunnel` → `10.99.0.2`
+
+### Configure Your System to Use SelfTunnel DNS
+
+**Option 1: Use dig/nslookup directly (testing)**
+```bash
+# Test DNS resolution
+dig @127.0.0.1 -p 5353 my-server.selftunnel
+nslookup my-server.selftunnel 127.0.0.1 -port=5353
+```
+
+**Option 2: Add to /etc/hosts (simple)**
+```bash
+# Add entries manually
+echo "10.99.0.2 my-server.selftunnel" | sudo tee -a /etc/hosts
+```
+
+**Option 3: Configure system resolver (Linux - systemd-resolved)**
+```bash
+# Create drop-in config for selftunnel domain
+sudo mkdir -p /etc/systemd/resolved.conf.d/
+sudo tee /etc/systemd/resolved.conf.d/selftunnel.conf <<EOF
+[Resolve]
+DNS=127.0.0.1:5353
+Domains=~selftunnel
+EOF
+
+sudo systemctl restart systemd-resolved
+```
+
+**Option 4: Configure dnsmasq (if installed)**
+```bash
+# Add to /etc/dnsmasq.conf
+echo "server=/selftunnel/127.0.0.1#5353" | sudo tee -a /etc/dnsmasq.conf
+sudo systemctl restart dnsmasq
+```
+
+**Option 5: Use port 53 (requires root DNS port)**
+
+Set `dns_port` to `53` in config.json to run DNS on standard port. Then configure your system to use `127.0.0.1` as a DNS server for the `.selftunnel` domain.
+
+### DNS Configuration Options
+
+Add these to your `config.json`:
+
+```json
+{
+  "dns_enabled": true,
+  "dns_port": 5353,
+  "dns_suffix": "selftunnel"
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `dns_enabled` | `true` | Enable/disable DNS server |
+| `dns_port` | `5353` | UDP port for DNS server |
+| `dns_suffix` | `selftunnel` | Domain suffix for peer names |
+
+### Usage Examples
+
+```bash
+# SSH using peer name
+ssh user@webserver.selftunnel
+
+# Ping a peer
+ping database.selftunnel
+
+# Access web service
+curl http://api-server.selftunnel:8080
+
+# MySQL connection
+mysql -h mysql.selftunnel -u root -p
 ```
 
 ## Commands
@@ -198,7 +286,10 @@ For named instances, config is stored in subdirectory (e.g., `/etc/selftunnel/of
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
     "stun:stun.cloudflare.com:3478"
-  ]
+  ],
+  "dns_enabled": true,
+  "dns_port": 5353,
+  "dns_suffix": "selftunnel"
 }
 ```
 
@@ -526,7 +617,7 @@ sudo modprobe tun
 ## Roadmap
 
 - [ ] TURN relay fallback for strict NATs
-- [ ] DNS resolution for peer names
+- [x] DNS resolution for peer names
 - [ ] Access control lists
 - [ ] Multi-hop routing for partial mesh
 - [ ] Mobile support (iOS/Android)

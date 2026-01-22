@@ -1,0 +1,322 @@
+package dns
+
+import (
+	"encoding/binary"
+	"fmt"
+	"log"
+	"net"
+	"strings"
+	"sync"
+)
+
+const (
+	DefaultDNSPort   = 5353
+	DefaultDNSSuffix = "selftunnel"
+)
+
+// PeerResolver interface for looking up peer IPs by name
+type PeerResolver interface {
+	GetPeerByName(name string) (virtualIP string, found bool)
+	GetLocalPeer() (name string, virtualIP string)
+}
+
+// Server is a simple DNS server for resolving peer names
+type Server struct {
+	resolver PeerResolver
+	port     int
+	suffix   string
+	upstream string
+	conn     *net.UDPConn
+	mu       sync.RWMutex
+	running  bool
+	stopCh   chan struct{}
+}
+
+// Config holds DNS server configuration
+type Config struct {
+	Port     int    // UDP port to listen on (default 5353)
+	Suffix   string // Domain suffix (default "selftunnel")
+	Upstream string // Upstream DNS server for non-local queries (default "8.8.8.8:53")
+}
+
+// NewServer creates a new DNS server
+func NewServer(resolver PeerResolver, cfg Config) *Server {
+	if cfg.Port == 0 {
+		cfg.Port = DefaultDNSPort
+	}
+	if cfg.Suffix == "" {
+		cfg.Suffix = DefaultDNSSuffix
+	}
+	if cfg.Upstream == "" {
+		cfg.Upstream = "8.8.8.8:53"
+	}
+
+	return &Server{
+		resolver: resolver,
+		port:     cfg.Port,
+		suffix:   cfg.Suffix,
+		upstream: cfg.Upstream,
+		stopCh:   make(chan struct{}),
+	}
+}
+
+// Start starts the DNS server
+func (s *Server) Start() error {
+	addr := &net.UDPAddr{Port: s.port}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on UDP port %d: %w", s.port, err)
+	}
+	s.conn = conn
+
+	s.mu.Lock()
+	s.running = true
+	s.mu.Unlock()
+
+	go s.serve()
+
+	log.Printf("DNS server started on port %d (suffix: .%s)", s.port, s.suffix)
+	return nil
+}
+
+// Stop stops the DNS server
+func (s *Server) Stop() {
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return
+	}
+	s.running = false
+	s.mu.Unlock()
+
+	close(s.stopCh)
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	log.Println("DNS server stopped")
+}
+
+func (s *Server) serve() {
+	buf := make([]byte, 512)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+
+		n, remoteAddr, err := s.conn.ReadFromUDP(buf)
+		if err != nil {
+			s.mu.RLock()
+			running := s.running
+			s.mu.RUnlock()
+			if !running {
+				return
+			}
+			continue
+		}
+
+		go s.handleQuery(buf[:n], remoteAddr)
+	}
+}
+
+func (s *Server) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
+	if len(data) < 12 {
+		return
+	}
+
+	// Parse DNS query
+	query, err := parseDNSQuery(data)
+	if err != nil {
+		return
+	}
+
+	// Check if it's a query for our suffix
+	name := strings.ToLower(query.Name)
+	suffix := "." + s.suffix + "."
+
+	if strings.HasSuffix(name, suffix) {
+		// Extract peer name
+		peerName := strings.TrimSuffix(name, suffix)
+		peerName = strings.TrimSuffix(peerName, ".") // Remove trailing dot if any
+
+		// Check if it's the local node
+		localName, localIP := s.resolver.GetLocalPeer()
+		if strings.EqualFold(peerName, localName) {
+			response := buildDNSResponse(query, localIP)
+			s.conn.WriteToUDP(response, remoteAddr)
+			return
+		}
+
+		// Look up peer
+		if ip, found := s.resolver.GetPeerByName(peerName); found {
+			response := buildDNSResponse(query, ip)
+			s.conn.WriteToUDP(response, remoteAddr)
+			return
+		}
+
+		// Peer not found - return NXDOMAIN
+		response := buildNXDomainResponse(query)
+		s.conn.WriteToUDP(response, remoteAddr)
+		return
+	}
+
+	// Forward to upstream DNS
+	upstreamResponse, err := s.forwardToUpstream(data)
+	if err != nil {
+		// Return SERVFAIL
+		response := buildServFailResponse(query)
+		s.conn.WriteToUDP(response, remoteAddr)
+		return
+	}
+	s.conn.WriteToUDP(upstreamResponse, remoteAddr)
+}
+
+func (s *Server) forwardToUpstream(query []byte) ([]byte, error) {
+	conn, err := net.Dial("udp", s.upstream)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+
+	response := make([]byte, 512)
+	n, err := conn.Read(response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response[:n], nil
+}
+
+// DNSQuery represents a parsed DNS query
+type DNSQuery struct {
+	ID     uint16
+	Name   string
+	QType  uint16
+	QClass uint16
+}
+
+func parseDNSQuery(data []byte) (*DNSQuery, error) {
+	if len(data) < 12 {
+		return nil, fmt.Errorf("packet too short")
+	}
+
+	query := &DNSQuery{
+		ID: binary.BigEndian.Uint16(data[0:2]),
+	}
+
+	// Parse question section
+	offset := 12
+	var nameParts []string
+	for offset < len(data) {
+		length := int(data[offset])
+		if length == 0 {
+			offset++
+			break
+		}
+		if offset+1+length > len(data) {
+			return nil, fmt.Errorf("malformed name")
+		}
+		nameParts = append(nameParts, string(data[offset+1:offset+1+length]))
+		offset += 1 + length
+	}
+	query.Name = strings.Join(nameParts, ".") + "."
+
+	if offset+4 > len(data) {
+		return nil, fmt.Errorf("missing qtype/qclass")
+	}
+	query.QType = binary.BigEndian.Uint16(data[offset : offset+2])
+	query.QClass = binary.BigEndian.Uint16(data[offset+2 : offset+4])
+
+	return query, nil
+}
+
+func buildDNSResponse(query *DNSQuery, ip string) []byte {
+	response := make([]byte, 0, 512)
+
+	// Header
+	response = append(response, byte(query.ID>>8), byte(query.ID)) // ID
+	response = append(response, 0x81, 0x80)                        // Flags: QR=1, AA=1, RD=1, RA=1
+	response = append(response, 0x00, 0x01)                        // QDCOUNT=1
+	response = append(response, 0x00, 0x01)                        // ANCOUNT=1
+	response = append(response, 0x00, 0x00)                        // NSCOUNT=0
+	response = append(response, 0x00, 0x00)                        // ARCOUNT=0
+
+	// Question section (copy from query)
+	response = appendDNSName(response, query.Name)
+	response = append(response, byte(query.QType>>8), byte(query.QType))
+	response = append(response, byte(query.QClass>>8), byte(query.QClass))
+
+	// Answer section
+	response = appendDNSName(response, query.Name)
+	response = append(response, 0x00, 0x01)             // TYPE=A
+	response = append(response, 0x00, 0x01)             // CLASS=IN
+	response = append(response, 0x00, 0x00, 0x00, 0x3c) // TTL=60
+	response = append(response, 0x00, 0x04)             // RDLENGTH=4
+
+	// Parse IP
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return buildNXDomainResponse(query)
+	}
+	ipv4 := parsedIP.To4()
+	if ipv4 == nil {
+		return buildNXDomainResponse(query)
+	}
+	response = append(response, ipv4...)
+
+	return response
+}
+
+func buildNXDomainResponse(query *DNSQuery) []byte {
+	response := make([]byte, 0, 512)
+
+	// Header with NXDOMAIN (RCODE=3)
+	response = append(response, byte(query.ID>>8), byte(query.ID))
+	response = append(response, 0x81, 0x83) // Flags: QR=1, AA=1, RD=1, RA=1, RCODE=3
+	response = append(response, 0x00, 0x01) // QDCOUNT=1
+	response = append(response, 0x00, 0x00) // ANCOUNT=0
+	response = append(response, 0x00, 0x00) // NSCOUNT=0
+	response = append(response, 0x00, 0x00) // ARCOUNT=0
+
+	// Question section
+	response = appendDNSName(response, query.Name)
+	response = append(response, byte(query.QType>>8), byte(query.QType))
+	response = append(response, byte(query.QClass>>8), byte(query.QClass))
+
+	return response
+}
+
+func buildServFailResponse(query *DNSQuery) []byte {
+	response := make([]byte, 0, 512)
+
+	// Header with SERVFAIL (RCODE=2)
+	response = append(response, byte(query.ID>>8), byte(query.ID))
+	response = append(response, 0x81, 0x82) // Flags: QR=1, AA=1, RD=1, RA=1, RCODE=2
+	response = append(response, 0x00, 0x01) // QDCOUNT=1
+	response = append(response, 0x00, 0x00) // ANCOUNT=0
+	response = append(response, 0x00, 0x00) // NSCOUNT=0
+	response = append(response, 0x00, 0x00) // ARCOUNT=0
+
+	// Question section
+	response = appendDNSName(response, query.Name)
+	response = append(response, byte(query.QType>>8), byte(query.QType))
+	response = append(response, byte(query.QClass>>8), byte(query.QClass))
+
+	return response
+}
+
+func appendDNSName(buf []byte, name string) []byte {
+	name = strings.TrimSuffix(name, ".")
+	parts := strings.Split(name, ".")
+	for _, part := range parts {
+		buf = append(buf, byte(len(part)))
+		buf = append(buf, []byte(part)...)
+	}
+	buf = append(buf, 0x00)
+	return buf
+}
