@@ -253,33 +253,53 @@ func (wg *WireGuardTunnel) WriteFromRelay(from string, data []byte) {
 	// Find the peer by public key
 	wg.peersMu.RLock()
 	peer, exists := wg.peers[from]
+	peerCount := len(wg.peers)
 	wg.peersMu.RUnlock()
 
 	if !exists {
-		log.Printf("[Relay] Received data from unknown peer: %s (have %d peers)", from[:16], len(wg.peers))
+		// Log all known peer keys for debugging
+		wg.peersMu.RLock()
+		knownKeys := make([]string, 0, len(wg.peers))
+		for k := range wg.peers {
+			if len(k) > 16 {
+				knownKeys = append(knownKeys, k[:16])
+			}
+		}
+		wg.peersMu.RUnlock()
+		log.Printf("[Relay] Received data from unknown peer: %s (have %d peers: %v)", from[:16], peerCount, knownKeys)
 		return
 	}
 
 	// Decrypt the packet using XOR with shared secret
 	decrypted := wg.decryptWithSecret(data, peer.sharedSecret)
 	if decrypted == nil {
-		log.Printf("[Relay] Failed to decrypt data from %s", from[:16])
+		log.Printf("[Relay] Failed to decrypt data from %s (data len: %d)", from[:16], len(data))
+		return
+	}
+
+	// Validate IP packet
+	if len(decrypted) < 20 {
+		log.Printf("[Relay] Decrypted packet too short: %d bytes", len(decrypted))
 		return
 	}
 
 	// Write to TUN
-	n, err := wg.tun.Write(decrypted)
-	if err != nil {
-		log.Printf("[Relay] Failed to write to TUN: %v", err)
+	n, tunErr := wg.tun.Write(decrypted)
+	if tunErr != nil {
+		log.Printf("[Relay] Failed to write to TUN: %v", tunErr)
 		return
 	}
-	log.Printf("[Relay] Received %d bytes from %s, wrote %d to TUN", len(data), from[:16], n)
 
-	// Update peer stats
+	// Log first successful receive for debugging
 	peer.mu.Lock()
-	peer.RxBytes += uint64(len(decrypted))
+	wasFirstPacket := peer.RxBytes == 0
+	peer.RxBytes += uint64(n)
 	peer.LastSeen = time.Now()
 	peer.mu.Unlock()
+
+	if wasFirstPacket {
+		log.Printf("[Relay] First packet received from %s (%d bytes written to TUN)", from[:16], n)
+	}
 
 	// Notify callback that we received data from this peer (via relay)
 	if wg.onDataReceived != nil {
@@ -419,8 +439,30 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 		return
 	}
 
+	// Skip multicast/broadcast traffic silently
+	if dstIP.IsMulticast() || dstIP.Equal(net.IPv4bcast) {
+		return
+	}
+	// Skip link-local addresses
+	if dstIP.IsLinkLocalMulticast() || dstIP.IsLinkLocalUnicast() {
+		return
+	}
+
 	peer := wg.findPeerForIP(dstIP)
 	if peer == nil {
+		// Only log for unicast traffic in our VPN range (10.99.x.x)
+		if len(dstIP) == 4 && dstIP[0] == 10 && dstIP[1] == 99 {
+			wg.peersMu.RLock()
+			peerCount := len(wg.peers)
+			var allowedIPs []string
+			for _, p := range wg.peers {
+				for _, allowed := range p.AllowedIPs {
+					allowedIPs = append(allowedIPs, allowed.String())
+				}
+			}
+			wg.peersMu.RUnlock()
+			log.Printf("[WG] No peer found for destination %s (have %d peers, allowedIPs: %v)", dstIP, peerCount, allowedIPs)
+		}
 		return
 	}
 
@@ -474,9 +516,10 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 		}
 	}
 
-	// Debug logging for non-ICMP large packets (like SSH)
+	// Debug logging only for VPN traffic
 	if !directSent && !relaySent {
-		log.Printf("[WG] FAILED to send %d byte packet to %s", len(packet), dstIP)
+		log.Printf("[WG] FAILED to send %d byte packet to %s (relay connected: %v)",
+			len(packet), dstIP, relay != nil && relay.IsConnected())
 	}
 }
 

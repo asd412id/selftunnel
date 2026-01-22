@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	DefaultDNSPort   = 5353
+	DefaultDNSPort   = 53
 	DefaultDNSSuffix = "selftunnel"
 )
 
@@ -26,6 +26,7 @@ type Server struct {
 	port     int
 	suffix   string
 	upstream string
+	bindIP   string
 	conn     *net.UDPConn
 	mu       sync.RWMutex
 	running  bool
@@ -34,9 +35,10 @@ type Server struct {
 
 // Config holds DNS server configuration
 type Config struct {
-	Port     int    // UDP port to listen on (default 5353)
+	Port     int    // UDP port to listen on (default 53)
 	Suffix   string // Domain suffix (default "selftunnel")
 	Upstream string // Upstream DNS server for non-local queries (default "8.8.8.8:53")
+	BindIP   string // IP to bind to (default "", meaning all interfaces)
 }
 
 // NewServer creates a new DNS server
@@ -56,16 +58,27 @@ func NewServer(resolver PeerResolver, cfg Config) *Server {
 		port:     cfg.Port,
 		suffix:   cfg.Suffix,
 		upstream: cfg.Upstream,
+		bindIP:   cfg.BindIP,
 		stopCh:   make(chan struct{}),
 	}
 }
 
 // Start starts the DNS server
 func (s *Server) Start() error {
-	addr := &net.UDPAddr{Port: s.port}
+	var addr *net.UDPAddr
+	if s.bindIP != "" {
+		ip := net.ParseIP(s.bindIP)
+		if ip == nil {
+			return fmt.Errorf("invalid bind IP: %s", s.bindIP)
+		}
+		addr = &net.UDPAddr{IP: ip, Port: s.port}
+	} else {
+		addr = &net.UDPAddr{Port: s.port}
+	}
+
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on UDP port %d: %w", s.port, err)
+		return fmt.Errorf("failed to listen on UDP %s:%d: %w", s.bindIP, s.port, err)
 	}
 	s.conn = conn
 
@@ -75,7 +88,11 @@ func (s *Server) Start() error {
 
 	go s.serve()
 
-	log.Printf("DNS server started on port %d (suffix: .%s)", s.port, s.suffix)
+	bindAddr := "0.0.0.0"
+	if s.bindIP != "" {
+		bindAddr = s.bindIP
+	}
+	log.Printf("DNS server started on %s:%d (suffix: .%s)", bindAddr, s.port, s.suffix)
 	return nil
 }
 

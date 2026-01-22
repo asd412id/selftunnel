@@ -4,16 +4,19 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
 )
 
 type HolePuncher struct {
-	localConn  *net.UDPConn
-	stunClient *STUNClient
-	mappedAddr *MappedAddress
-	mu         sync.RWMutex
+	localConn   *net.UDPConn
+	stunClient  *STUNClient
+	mappedAddr  *MappedAddress
+	natType     NATType
+	natDetected bool // Flag to prevent multiple NAT detection goroutines
+	mu          sync.RWMutex
 }
 
 type PunchResult struct {
@@ -55,10 +58,11 @@ func NewHolePuncherWithPort(stunServers []string, port int) (*HolePuncher, error
 	}, nil
 }
 
-// DiscoverPublicAddr uses STUN to discover the public address
+// DiscoverPublicAddr uses STUN to discover the public address and detect NAT type
 func (hp *HolePuncher) DiscoverPublicAddr() (*MappedAddress, error) {
 	localAddr := hp.localConn.LocalAddr().(*net.UDPAddr)
 
+	// First get mapped address
 	mapped, err := hp.stunClient.GetMappedAddress(localAddr)
 	if err != nil {
 		return nil, err
@@ -66,9 +70,51 @@ func (hp *HolePuncher) DiscoverPublicAddr() (*MappedAddress, error) {
 
 	hp.mu.Lock()
 	hp.mappedAddr = mapped
+	alreadyDetecting := hp.natDetected
+	hp.natDetected = true
 	hp.mu.Unlock()
 
+	// Detect NAT type in background (only once)
+	if !alreadyDetecting {
+		go func() {
+			// Use timeout to prevent hanging
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			done := make(chan struct{})
+			var natType NATType
+			var detectErr error
+
+			go func() {
+				natType, detectErr = hp.stunClient.DetectNATType(localAddr)
+				close(done)
+			}()
+
+			select {
+			case <-ctx.Done():
+				log.Printf("[NAT] NAT type detection timed out")
+				return
+			case <-done:
+				if detectErr != nil {
+					log.Printf("[NAT] Could not detect NAT type: %v", detectErr)
+					return
+				}
+				hp.mu.Lock()
+				hp.natType = natType
+				hp.mu.Unlock()
+				log.Printf("[NAT] Detected NAT type: %s", natType)
+			}
+		}()
+	}
+
 	return mapped, nil
+}
+
+// GetNATType returns the detected NAT type
+func (hp *HolePuncher) GetNATType() NATType {
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	return hp.natType
 }
 
 // GetMappedAddr returns the discovered public address
@@ -155,10 +201,7 @@ func (hp *HolePuncher) attemptPunch(ctx context.Context, peerAddr *net.UDPAddr) 
 }
 
 // SimultaneousPunch performs simultaneous open with a peer
-// Returns the peer's actual address from which we received punch packets
-// NOTE: Since UDP connection is shared with WireGuard, punch packets may be received
-// by WireGuard instead of this receiver. The WireGuard handler should call back
-// to update peer endpoints when it receives punch packets.
+// Uses birthday attack for symmetric NAT traversal
 func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []string, duration time.Duration) (*net.UDPAddr, error) {
 	deadline := time.Now().Add(duration)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -181,10 +224,26 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 		}
 	}
 
-	// Add port predictions for symmetric NAT traversal
+	// Get NAT info for smarter port prediction
+	hp.mu.RLock()
+	natType := hp.natType
+	portDelta := hp.stunClient.GetPortDelta()
+	hp.mu.RUnlock()
+
+	// Generate predicted ports based on NAT type
 	var predictedAddrs []*net.UDPAddr
+
 	for _, addr := range peerAddrs {
-		if isPublicIPAddr(addr.IP) {
+		if !isPublicIPAddr(addr.IP) {
+			continue
+		}
+
+		if natType == NATTypeSymmetric {
+			// For symmetric NAT: use birthday attack with wider range
+			// Also use port delta if detected
+			predictedAddrs = append(predictedAddrs, generateSymmetricNATPorts(addr, portDelta, seenAddrs)...)
+		} else {
+			// For cone NAT: use smaller range around known port
 			for offset := -10; offset <= 10; offset++ {
 				if offset == 0 {
 					continue
@@ -203,18 +262,21 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 	}
 
 	allAddrs := append(peerAddrs, predictedAddrs...)
-	log.Printf("[HolePunch] Punching to %d endpoints (%d original + %d predicted)", len(allAddrs), len(peerAddrs), len(predictedAddrs))
+	log.Printf("[HolePunch] Punching to %d endpoints (%d original + %d predicted, NAT: %s)",
+		len(allAddrs), len(peerAddrs), len(predictedAddrs), natType)
 
 	if len(allAddrs) == 0 {
 		return nil, fmt.Errorf("no valid peer endpoints")
 	}
 
-	// Just send punch packets - don't try to receive here since WireGuard will handle incoming
-	// Send for the full duration to give peer time to respond
-	ticker := time.NewTicker(20 * time.Millisecond)
+	// Send punch packets at high rate for birthday attack
+	// For symmetric NAT, we need to hit the right port combination
+	ticker := time.NewTicker(10 * time.Millisecond) // Faster for birthday attack
 	defer ticker.Stop()
 
 	packetsSent := 0
+	batchSize := 50 // Send to multiple addresses per tick
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -230,12 +292,67 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 			}
 			return nil, fmt.Errorf("punch timeout")
 		case <-ticker.C:
-			for _, addr := range allAddrs {
-				hp.localConn.WriteToUDP(punchPacket, addr)
-				packetsSent++
+			// Send to a batch of addresses
+			for i := 0; i < batchSize && i < len(allAddrs); i++ {
+				idx := (packetsSent + i) % len(allAddrs)
+				hp.localConn.WriteToUDP(punchPacket, allAddrs[idx])
+			}
+			packetsSent += batchSize
+		}
+	}
+}
+
+// generateSymmetricNATPorts generates port predictions for symmetric NAT using birthday attack
+func generateSymmetricNATPorts(addr *net.UDPAddr, portDelta int, seen map[string]bool) []*net.UDPAddr {
+	var addrs []*net.UDPAddr
+	basePort := addr.Port
+
+	// Strategy 1: Sequential ports around base (±100)
+	for offset := -100; offset <= 100; offset++ {
+		if offset == 0 {
+			continue
+		}
+		port := basePort + offset
+		if port > 1024 && port < 65535 {
+			predicted := &net.UDPAddr{IP: addr.IP, Port: port}
+			key := predicted.String()
+			if !seen[key] {
+				seen[key] = true
+				addrs = append(addrs, predicted)
 			}
 		}
 	}
+
+	// Strategy 2: Use detected port delta if available
+	if portDelta != 0 && portDelta > 0 && portDelta < 100 {
+		for i := 1; i <= 50; i++ {
+			port := basePort + (portDelta * i)
+			if port > 1024 && port < 65535 {
+				predicted := &net.UDPAddr{IP: addr.IP, Port: port}
+				key := predicted.String()
+				if !seen[key] {
+					seen[key] = true
+					addrs = append(addrs, predicted)
+				}
+			}
+		}
+	}
+
+	// Strategy 3: Birthday attack - random ports in ephemeral range
+	// For symmetric NAT, both sides use random ports, so we try many combinations
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < 200; i++ {
+		// Focus on ephemeral port range (32768-65535) where most NATs allocate
+		port := 32768 + rng.Intn(32767)
+		predicted := &net.UDPAddr{IP: addr.IP, Port: port}
+		key := predicted.String()
+		if !seen[key] {
+			seen[key] = true
+			addrs = append(addrs, predicted)
+		}
+	}
+
+	return addrs
 }
 
 // Close closes the hole puncher

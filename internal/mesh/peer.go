@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -141,18 +142,19 @@ func (pm *PeerManager) GetPeerByIP(ip string) *Peer {
 	return pm.peersByIP[ip]
 }
 
-// GetPeerByName returns a peer by name
+// GetPeerByName returns a peer by name (case-insensitive)
 func (pm *PeerManager) GetPeerByName(name string) *Peer {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
+	nameLower := strings.ToLower(name)
 	for _, peer := range pm.peers {
-		if peer.Name == name {
+		if strings.ToLower(peer.Name) == nameLower {
 			return peer
 		}
 	}
 	// Also check local peer
-	if pm.localPeer != nil && pm.localPeer.Name == name {
+	if pm.localPeer != nil && strings.ToLower(pm.localPeer.Name) == nameLower {
 		return pm.localPeer
 	}
 	return nil

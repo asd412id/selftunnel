@@ -290,8 +290,21 @@ func (c *Client) Unregister() error {
 
 // Start starts the background tasks (heartbeat, peer polling)
 func (c *Client) Start() {
-	// Fetch peers immediately on start
+	// Fetch peers immediately on start (tracked by wait group)
+	c.wg.Add(1)
 	go func() {
+		defer c.wg.Done()
+
+		// Use context-aware HTTP request
+		ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+		defer cancel()
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		peers, err := c.GetPeers()
 		if err == nil {
 			c.mu.RLock()
@@ -358,7 +371,32 @@ func (c *Client) peerPollingLoop() {
 
 // Stop stops the client and background tasks
 func (c *Client) Stop() {
-	c.Unregister()
+	// Cancel context first to stop goroutines
 	c.cancel()
-	c.wg.Wait()
+
+	// Unregister with timeout
+	done := make(chan struct{})
+	go func() {
+		c.Unregister()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		// Unregister timed out, continue anyway
+	}
+
+	// Wait for goroutines with timeout
+	waitDone := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		// Goroutines didn't stop in time
+	}
 }

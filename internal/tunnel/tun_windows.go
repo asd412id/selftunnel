@@ -83,6 +83,9 @@ func (w *WindowsTUN) Write(buf []byte) (int, error) {
 }
 
 func (w *WindowsTUN) Close() error {
+	// Cleanup DNS NRPT rules
+	cleanupWindowsDNS()
+
 	w.session.End()
 	return w.adapter.Close()
 }
@@ -133,6 +136,29 @@ func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error 
 	}
 	log.Printf("Set IP address %s/%s on interface %s", ip, subnetMask, name)
 
+	// Set DNS server to use our own DNS on the VPN IP
+	cmd = exec.Command("netsh", "interface", "ip", "set", "dns",
+		name, "static", ip)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("netsh set dns output: %s", string(output))
+		log.Printf("Warning: failed to set DNS server: %v", err)
+	} else {
+		log.Printf("Set DNS server %s on interface %s", ip, name)
+	}
+
+	// Add NRPT rule for .selftunnel domain using PowerShell
+	// This tells Windows to use our DNS server for *.selftunnel queries
+	psCmd := fmt.Sprintf(`Add-DnsClientNrptRule -Namespace ".selftunnel" -NameServers "%s" -ErrorAction SilentlyContinue`, ip)
+	cmd = exec.Command("powershell", "-Command", psCmd)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("PowerShell NRPT output: %s", string(output))
+		log.Printf("Warning: failed to add NRPT rule: %v (DNS may not work for .selftunnel)", err)
+	} else {
+		log.Printf("Added NRPT rule for .selftunnel -> %s", ip)
+	}
+
 	// Set MTU using netsh
 	if mtu > 0 {
 		cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
@@ -148,4 +174,11 @@ func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error 
 	}
 
 	return nil
+}
+
+// cleanupWindowsDNS removes NRPT rules when shutting down
+func cleanupWindowsDNS() {
+	psCmd := `Get-DnsClientNrptRule | Where-Object {$_.Namespace -eq ".selftunnel"} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue`
+	cmd := exec.Command("powershell", "-Command", psCmd)
+	cmd.Run() // Ignore errors during cleanup
 }

@@ -249,7 +249,7 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 			log.Printf("[Discovery] Could not send punch request via relay: %v", err)
 		} else {
 			log.Printf("[Discovery] Sent punch request to %s", peerName)
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond) // Short wait for relay to forward
 		}
 	}
 
@@ -259,12 +259,12 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 
 	log.Printf("[Discovery] Punching to %s (%d public, %d private endpoints)", peerName, len(publicEndpoints), len(privateEndpoints))
 
-	// Send punch packets for 5 seconds
+	// Send punch packets for 2 seconds (reduced from 5s for faster connection)
 	// Actual endpoint will be set by WireGuard when it receives punch response
-	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
 	defer cancel()
 
-	_, _ = d.holePuncher.SimultaneousPunch(ctx, allEndpoints, 5*time.Second)
+	_, _ = d.holePuncher.SimultaneousPunch(ctx, allEndpoints, 2*time.Second)
 
 	// Check if peer got connected via WireGuard callback
 	peer.mu.Lock()

@@ -226,7 +226,14 @@ func (c *Client) Connect() error {
 
 // Close closes the relay connection
 func (c *Client) Close() {
-	close(c.ctx.done)
+	// Signal goroutines to stop
+	select {
+	case <-c.ctx.done:
+		// Already closed
+		return
+	default:
+		close(c.ctx.done)
+	}
 
 	c.connMu.Lock()
 	if c.conn != nil {
@@ -235,7 +242,19 @@ func (c *Client) Close() {
 	c.connected = false
 	c.connMu.Unlock()
 
-	c.wg.Wait()
+	// Wait with timeout to prevent hanging
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean shutdown
+	case <-time.After(3 * time.Second):
+		log.Printf("[Relay] Close timeout, forcing shutdown")
+	}
 }
 
 // IsConnected returns true if connected to relay
@@ -263,12 +282,17 @@ func (c *Client) Send(to string, data []byte) error {
 	}
 
 	// Use timeout to avoid blocking forever but also avoid dropping packets
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+
 	select {
 	case c.sendCh <- msgBytes:
 		return nil
-	case <-time.After(100 * time.Millisecond):
+	case <-timer.C:
 		log.Printf("[Relay] WARNING: send buffer full, packet dropped")
 		return fmt.Errorf("send buffer full")
+	case <-c.ctx.done:
+		return fmt.Errorf("client closed")
 	}
 }
 

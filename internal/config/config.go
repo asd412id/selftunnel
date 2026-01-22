@@ -12,8 +12,8 @@ const (
 	DefaultKeepalive    = 25
 	DefaultVirtualCIDR  = "10.99.0.0/24"
 	DefaultSignalingURL = "https://selftunnel.maccaqe.id"
-	DefaultDNSPort      = 53530
-	DefaultDNSSuffix    = "mesh"
+	DefaultDNSPort      = 53
+	DefaultDNSSuffix    = "selftunnel"
 )
 
 type Config struct {
@@ -29,9 +29,10 @@ type Config struct {
 	VirtualCIDR   string `json:"virtual_cidr"`
 
 	// Connection settings
-	ListenPort int `json:"listen_port"`
-	MTU        int `json:"mtu"`
-	Keepalive  int `json:"keepalive"`
+	ListenPort  int  `json:"listen_port"`
+	MTU         int  `json:"mtu"`
+	Keepalive   int  `json:"keepalive"`
+	UseNativeWG bool `json:"use_native_wg"` // Use native wireguard-go instead of custom implementation
 
 	// Signaling server
 	SignalingURL string `json:"signaling_url"`

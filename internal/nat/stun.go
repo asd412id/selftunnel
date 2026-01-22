@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"sort"
 	"time"
 )
 
@@ -17,10 +19,41 @@ const (
 	stunHeaderSize           = 20
 )
 
+// NATType represents the type of NAT
+type NATType int
+
+const (
+	NATTypeUnknown NATType = iota
+	NATTypeNone            // No NAT (public IP)
+	NATTypeFullCone
+	NATTypeRestrictedCone
+	NATTypePortRestricted
+	NATTypeSymmetric
+)
+
+func (n NATType) String() string {
+	switch n {
+	case NATTypeNone:
+		return "None (Public IP)"
+	case NATTypeFullCone:
+		return "Full Cone"
+	case NATTypeRestrictedCone:
+		return "Restricted Cone"
+	case NATTypePortRestricted:
+		return "Port Restricted Cone"
+	case NATTypeSymmetric:
+		return "Symmetric"
+	default:
+		return "Unknown"
+	}
+}
+
 type STUNClient struct {
-	servers []string
-	timeout time.Duration
-	conn    *net.UDPConn // shared connection (optional)
+	servers   []string
+	timeout   time.Duration
+	conn      *net.UDPConn // shared connection (optional)
+	natType   NATType
+	portDelta int // detected port increment for symmetric NAT
 }
 
 type MappedAddress struct {
@@ -38,6 +71,88 @@ func NewSTUNClient(servers []string) *STUNClient {
 // SetConn sets a shared UDP connection for STUN queries
 func (c *STUNClient) SetConn(conn *net.UDPConn) {
 	c.conn = conn
+}
+
+// GetNATType returns the detected NAT type
+func (c *STUNClient) GetNATType() NATType {
+	return c.natType
+}
+
+// GetPortDelta returns the detected port increment for symmetric NAT
+func (c *STUNClient) GetPortDelta() int {
+	return c.portDelta
+}
+
+// DetectNATType queries multiple STUN servers to detect NAT type
+func (c *STUNClient) DetectNATType(localAddr *net.UDPAddr) (NATType, error) {
+	if len(c.servers) < 2 {
+		return NATTypeUnknown, errors.New("need at least 2 STUN servers to detect NAT type")
+	}
+
+	// Query multiple STUN servers to see if we get same or different ports
+	var mappings []*MappedAddress
+	var ports []int
+
+	for i := 0; i < min(len(c.servers), 3); i++ {
+		addr, err := c.queryServer(c.servers[i], localAddr)
+		if err != nil {
+			continue
+		}
+		mappings = append(mappings, addr)
+		ports = append(ports, addr.Port)
+	}
+
+	if len(mappings) < 2 {
+		return NATTypeUnknown, errors.New("could not get enough STUN responses")
+	}
+
+	// Check if local IP is same as mapped IP (no NAT)
+	if localAddr != nil && mappings[0].IP.Equal(localAddr.IP) {
+		c.natType = NATTypeNone
+		return NATTypeNone, nil
+	}
+
+	// Check if all ports are the same
+	allSame := true
+	for i := 1; i < len(ports); i++ {
+		if ports[i] != ports[0] {
+			allSame = false
+			break
+		}
+	}
+
+	if allSame {
+		// Same port to different servers = Cone NAT (not symmetric)
+		c.natType = NATTypePortRestricted // Assume port restricted (most common)
+		log.Printf("[STUN] NAT Type: Cone NAT (port %d same across servers)", ports[0])
+		return NATTypePortRestricted, nil
+	}
+
+	// Different ports = Symmetric NAT
+	c.natType = NATTypeSymmetric
+
+	// Try to detect port increment pattern
+	sort.Ints(ports)
+	deltas := make([]int, len(ports)-1)
+	for i := 1; i < len(ports); i++ {
+		deltas[i-1] = ports[i] - ports[i-1]
+	}
+
+	// Check if deltas are consistent
+	if len(deltas) >= 2 {
+		avgDelta := 0
+		for _, d := range deltas {
+			avgDelta += d
+		}
+		avgDelta /= len(deltas)
+		c.portDelta = avgDelta
+		log.Printf("[STUN] NAT Type: Symmetric (ports: %v, avg delta: %d)", ports, avgDelta)
+	} else if len(deltas) == 1 {
+		c.portDelta = deltas[0]
+		log.Printf("[STUN] NAT Type: Symmetric (ports: %v, delta: %d)", ports, c.portDelta)
+	}
+
+	return NATTypeSymmetric, nil
 }
 
 // GetMappedAddress queries STUN servers to get the public IP and port
