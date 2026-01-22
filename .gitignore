@@ -59,7 +59,6 @@ worker/.wrangler/
 dist/
 build/
 release/
-deploy/
 
 # Logs
 *.log

@@ -1,0 +1,4 @@
+# Replace signaling.example.com with your domain
+signaling.example.com {
+    reverse_proxy signaling-server:8080
+}

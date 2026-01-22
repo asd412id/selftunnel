@@ -1,0 +1,34 @@
+[Unit]
+Description=SelfTunnel Signaling Server
+Documentation=https://github.com/asd412id/selftunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=selftunnel
+Group=selftunnel
+ExecStart=/usr/local/bin/signaling-server -port 8080
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=selftunnel-signaling
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+services:
+  signaling-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: selftunnel-signaling:latest
+    container_name: selftunnel-signaling
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - TZ=Asia/Jakarta
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional: Caddy reverse proxy for HTTPS
+  # Uncomment if you want automatic HTTPS without Cloudflare Tunnel
+  # caddy:
+  #   image: caddy:2-alpine
+  #   container_name: selftunnel-caddy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - signaling-server
+
+# volumes:
+#   caddy_data:
+#   caddy_config:
