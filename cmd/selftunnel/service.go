@@ -127,36 +127,41 @@ func setupNetworkConfig(instanceName, networkID, networkSecret, nodeName, signal
 		cfg.SignalingURL = signalingURL
 	}
 
-	// Create hole puncher for NAT traversal
-	hp, err := nat.NewHolePuncherWithPort(cfg.STUNServers, cfg.ListenPort)
+	// Try to create hole puncher for NAT traversal (non-fatal if fails)
+	var endpoints []string
+	hp, err := nat.NewHolePuncher(cfg.STUNServers) // Use random port to avoid conflicts
 	if err != nil {
-		return fmt.Errorf("failed to create hole puncher: %w", err)
-	}
-	defer hp.Close()
-
-	// Discover public address
-	mapped, err := hp.DiscoverPublicAddr()
-	if err != nil {
-		fmt.Printf("Warning: Could not discover public address: %v\n", err)
+		fmt.Printf("Warning: Could not create hole puncher: %v\n", err)
+		fmt.Println("Continuing without NAT discovery (will be done when service starts)...")
 	} else {
-		fmt.Printf("Public endpoint: %s:%d\n", mapped.IP, mapped.Port)
+		defer hp.Close()
+
+		// Discover public address
+		mapped, err := hp.DiscoverPublicAddr()
+		if err != nil {
+			fmt.Printf("Warning: Could not discover public address: %v\n", err)
+		} else {
+			fmt.Printf("Public endpoint: %s:%d\n", mapped.IP, mapped.Port)
+		}
+		endpoints = hp.GetEndpoints()
 	}
 
 	// Create local peer
 	localPeer := &mesh.Peer{
 		Name:      cfg.NodeName,
 		PublicKey: cfg.PublicKey,
-		Endpoints: hp.GetEndpoints(),
+		Endpoints: endpoints,
 	}
 
 	// Connect to signaling server
+	fmt.Printf("Connecting to signaling server: %s\n", cfg.SignalingURL)
 	client := signaling.NewClient(cfg.SignalingURL, cfg.NetworkID, cfg.NetworkSecret)
 	client.SetLocalPeer(localPeer)
 
 	// Register with signaling server
 	resp, err := client.Register()
 	if err != nil {
-		return fmt.Errorf("failed to register with network: %w", err)
+		return fmt.Errorf("failed to register with network: %w\n\nPlease check:\n  1. Network ID and Secret are correct\n  2. Signaling server is accessible: %s\n  3. No firewall/proxy blocking the connection", cfg.SignalingURL)
 	}
 
 	cfg.VirtualIP = resp.VirtualIP
