@@ -1,6 +1,6 @@
 # SelfTunnel Signaling Server Deployment
 
-Deploy signaling server ke VPS untuk koordinasi peer discovery dan relay fallback.
+Deploy signaling server untuk koordinasi peer discovery dan relay fallback.
 
 ## Arsitektur
 
@@ -8,8 +8,8 @@ Deploy signaling server ke VPS untuk koordinasi peer discovery dan relay fallbac
 Internet                         VPS
 ─────────────────────────────────────────────────────
                             ┌─────────────────────┐
-  selftunnel.domain.com     │  Reverse Proxy      │
-  ─────────────────────────►│  (Caddy/Nginx/CF)   │
+  selftunnel.domain.com     │  Cloudflare Tunnel  │
+  ─────────────────────────►│    (cloudflared)    │
         HTTPS/WSS           │        │            │
                             │        ▼            │
                             │  ┌─────────────┐    │
@@ -20,163 +20,64 @@ Internet                         VPS
                             └─────────────────────┘
 ```
 
-## Quick Start
+## Quick Start (Docker + Cloudflare Tunnel)
 
-### Option 1: Docker + Cloudflare Tunnel (Recommended)
+### 1. Create Cloudflare Tunnel
+
+1. Login ke [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com)
+2. Pergi ke **Access** > **Tunnels** > **Create a tunnel**
+3. Pilih **Cloudflared** connector
+4. Beri nama tunnel: `selftunnel-signaling`
+5. Pilih **Docker** sebagai environment
+6. Copy token (string panjang setelah `--token`)
+
+### 2. Configure Public Hostname
+
+Di konfigurasi tunnel:
+- **Public hostname**: `signaling.yourdomain.com`
+- **Service**: `http://signaling-server:8080`
+
+> Note: Gunakan `signaling-server` (nama container), bukan `localhost`
+
+### 3. Deploy
 
 ```bash
 # Clone repository
 git clone https://github.com/asd412id/selftunnel.git
 cd selftunnel/deploy/docker
 
-# Create .env with your Cloudflare Tunnel token
-cp .env.example .env
-nano .env  # Edit TUNNEL_TOKEN
-
-# Start with Cloudflare Tunnel
-docker compose -f compose.tunnel.yaml up -d
-```
-
-**Getting Cloudflare Tunnel Token:**
-1. Go to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com)
-2. Access > Tunnels > Create a tunnel
-3. Name your tunnel (e.g., `selftunnel-signaling`)
-4. Select Docker as environment
-5. Copy the token from the command (the long string after `--token`)
-6. Configure public hostname: `signaling.yourdomain.com` → `http://signaling-server:8080`
-
-### Option 2: Docker (HTTP/HTTPS)
-
-```bash
-cd selftunnel/deploy/docker
-
-# Basic (HTTP only, port 8080)
-docker compose up -d
-
-# With HTTPS (Caddy auto-SSL)
-# Edit Caddyfile first with your domain
-docker compose -f compose.https.yaml up -d
-```
-
-### Option 3: Systemd Service
-
-```bash
-# One-liner install
-curl -sSL https://raw.githubusercontent.com/asd412id/selftunnel/main/deploy/systemd/install.sh | sudo bash
-
-# Or manual:
-# Download binary
-wget https://github.com/asd412id/selftunnel/releases/latest/download/signaling-server-linux-amd64
-chmod +x signaling-server-linux-amd64
-sudo mv signaling-server-linux-amd64 /usr/local/bin/signaling-server
-
-# Install service
-sudo cp deploy/systemd/selftunnel-signaling.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now selftunnel-signaling
-```
-
----
-
-## Detailed Setup
-
-### Docker + Cloudflare Tunnel (Recommended)
-
-This is the easiest way to deploy - no need to manage SSL certificates or open firewall ports.
-
-#### Step 1: Create Cloudflare Tunnel
-
-1. Login to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com)
-2. Go to **Access** > **Tunnels**
-3. Click **Create a tunnel**
-4. Choose **Cloudflared** connector
-5. Name your tunnel: `selftunnel-signaling`
-6. Click **Save tunnel**
-7. Select **Docker** as your environment
-8. Copy the token (long string after `--token`)
-
-#### Step 2: Configure Public Hostname
-
-In the tunnel configuration:
-- **Public hostname**: `signaling.yourdomain.com`
-- **Service**: `http://signaling-server:8080`
-
-> Note: Use `signaling-server` (container name) not `localhost`
-
-#### Step 3: Deploy
-
-```bash
-cd deploy/docker
-
-# Create .env file
-cp .env.example .env
-
-# Edit and paste your token
-nano .env
-# TUNNEL_TOKEN=eyJhIjoixxxxx...
+# Set tunnel token
+export TUNNEL_TOKEN=eyJhIjoixxxxx...
 
 # Start services
-docker compose -f compose.tunnel.yaml up -d
-
-# Check logs
-docker compose -f compose.tunnel.yaml logs -f
-
-# Check health
-curl https://signaling.yourdomain.com/health
-```
-
-#### Manage
-
-```bash
-# Stop
-docker compose -f compose.tunnel.yaml down
-
-# Restart
-docker compose -f compose.tunnel.yaml restart
-
-# Update
-docker compose -f compose.tunnel.yaml pull
-docker compose -f compose.tunnel.yaml up -d
-
-# View logs
-docker compose -f compose.tunnel.yaml logs -f cloudflared
-docker compose -f compose.tunnel.yaml logs -f signaling-server
-```
-
----
-
-### Docker Deployment (Without Cloudflare Tunnel)
-
-#### Basic Setup (HTTP)
-
-```bash
-cd deploy/docker
 docker compose up -d
 
 # Check logs
 docker compose logs -f
 
 # Check health
-curl http://localhost:8080/health
+curl https://signaling.yourdomain.com/health
 ```
 
-#### With HTTPS (Caddy)
+## Management
 
-1. Edit `Caddyfile`:
-```
-signaling.yourdomain.com {
-    reverse_proxy signaling-server:8080
-}
-```
-
-2. Run:
 ```bash
-docker compose -f compose.https.yaml up -d
+# Stop
+docker compose down
+
+# Restart
+docker compose restart
+
+# Update
+docker compose pull
+docker compose up -d
+
+# View logs
+docker compose logs -f cloudflared
+docker compose logs -f signaling-server
 ```
 
-Caddy akan otomatis mendapatkan SSL certificate dari Let's Encrypt.
-
-#### Build from Source
+## Build from Source
 
 ```bash
 # Build image
@@ -188,9 +89,9 @@ docker run -d --name signaling -p 8080:8080 selftunnel-signaling:latest
 
 ---
 
-### Systemd Deployment
+## Systemd Deployment (Alternative)
 
-#### Automatic Install
+### Automatic Install
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/asd412id/selftunnel/main/deploy/systemd/install.sh | sudo bash
@@ -202,29 +103,24 @@ Script ini akan:
 - Install dan enable service
 - Start service
 
-#### Manual Install
+### Manual Install
 
-1. Download binary:
 ```bash
+# Download binary
 wget https://github.com/asd412id/selftunnel/releases/latest/download/signaling-server-linux-amd64
 chmod +x signaling-server-linux-amd64
 sudo mv signaling-server-linux-amd64 /usr/local/bin/signaling-server
-```
 
-2. Create user:
-```bash
+# Create user
 sudo useradd -r -s /bin/false selftunnel
-```
 
-3. Install service:
-```bash
+# Install service
 sudo cp deploy/systemd/selftunnel-signaling.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable selftunnel-signaling
-sudo systemctl start selftunnel-signaling
+sudo systemctl enable --now selftunnel-signaling
 ```
 
-#### Service Management
+### Service Management
 
 ```bash
 # Status
@@ -235,84 +131,12 @@ sudo journalctl -u selftunnel-signaling -f
 
 # Restart
 sudo systemctl restart selftunnel-signaling
-
-# Stop
-sudo systemctl stop selftunnel-signaling
 ```
 
-#### Uninstall
+### Uninstall
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/asd412id/selftunnel/main/deploy/systemd/uninstall.sh | sudo bash
-# Or
-sudo bash deploy/systemd/uninstall.sh
-```
-
----
-
-### Reverse Proxy Setup
-
-#### Nginx
-
-```nginx
-server {
-    listen 443 ssl http2;
-    server_name signaling.yourdomain.com;
-
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # WebSocket timeout
-        proxy_read_timeout 86400;
-    }
-}
-```
-
-#### Caddy
-
-```
-signaling.yourdomain.com {
-    reverse_proxy localhost:8080
-}
-```
-
-#### Cloudflare Tunnel
-
-```bash
-# Quick tunnel (testing)
-cloudflared tunnel --url http://localhost:8080
-
-# Named tunnel (production)
-cloudflared tunnel login
-cloudflared tunnel create selftunnel-signaling
-
-# Create config
-cat > ~/.cloudflared/config.yml << EOF
-tunnel: selftunnel-signaling
-credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
-
-ingress:
-  - hostname: signaling.yourdomain.com
-    service: http://localhost:8080
-  - service: http_status:404
-EOF
-
-# Route DNS
-cloudflared tunnel route dns selftunnel-signaling signaling.yourdomain.com
-
-# Run as service
-sudo cloudflared service install
-sudo systemctl enable --now cloudflared
 ```
 
 ---
@@ -326,30 +150,6 @@ curl https://signaling.yourdomain.com/health
 # {"status":"ok","service":"selftunnel-signaling","version":"2.0.0",...}
 ```
 
-### Register Peer
-
-```bash
-curl -X POST https://signaling.yourdomain.com/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "network_id": "test-network",
-    "network_secret": "test-secret",
-    "peer": {
-      "name": "test-peer",
-      "public_key": "test-key-123",
-      "endpoints": ["1.2.3.4:51820"]
-    }
-  }'
-```
-
-### Get Peers
-
-```bash
-curl -H "X-Network-ID: test-network" \
-     -H "X-Network-Secret: test-secret" \
-     https://signaling.yourdomain.com/peers
-```
-
 ### WebSocket Relay
 
 ```bash
@@ -359,112 +159,39 @@ wscat -c wss://signaling.yourdomain.com/relay
 
 ---
 
-## Monitoring
-
-### Docker
-
-```bash
-# Logs
-docker compose logs -f signaling-server
-
-# Stats
-docker stats selftunnel-signaling
-```
-
-### Systemd
-
-```bash
-# Logs
-sudo journalctl -u selftunnel-signaling -f
-
-# Resource usage
-systemctl status selftunnel-signaling
-```
-
----
-
-## Firewall
-
-### With Reverse Proxy
-
-```bash
-# Only allow HTTPS
-sudo ufw allow 443/tcp
-```
-
-### Direct Access (not recommended)
-
-```bash
-sudo ufw allow 8080/tcp
-```
-
-### Cloudflare Tunnel
-
-Tidak perlu membuka port apapun! Cloudflared membuat koneksi outbound.
-
----
-
 ## Troubleshooting
 
 ### Service won't start
 
 ```bash
 # Check logs
-sudo journalctl -u selftunnel-signaling -n 50
-
-# Check if port in use
-sudo ss -tulpn | grep 8080
+docker compose logs -f
 
 # Run manually for debugging
-sudo /usr/local/bin/signaling-server -port 8080
+docker compose run --rm signaling-server
 ```
 
 ### WebSocket not working
 
-1. Pastikan reverse proxy mendukung WebSocket
-2. Untuk Cloudflare: Dashboard > Network > WebSockets = ON
-3. Check nginx config: `proxy_set_header Upgrade` dan `Connection "upgrade"`
-
-### High memory/CPU
-
-```bash
-# Check connections
-curl http://localhost:8080/health | jq .stats
-```
+Pastikan WebSocket enabled di Cloudflare:
+Dashboard > Network > WebSockets = ON
 
 ### Connection timeout
 
 ```bash
 # Test dari server lokal
-curl http://localhost:8080/health
+docker compose exec signaling-server wget -qO- http://localhost:8080/health
 
-# Test dari luar
-curl https://signaling.yourdomain.com/health
-
-# Check firewall
-sudo ufw status
+# Check tunnel status
+docker compose logs cloudflared
 ```
 
 ---
 
 ## Update
 
-### Docker
-
 ```bash
 cd deploy/docker
 docker compose pull
 docker compose up -d
-```
-
-### Systemd
-
-```bash
-# Download new binary
-wget https://github.com/asd412id/selftunnel/releases/latest/download/signaling-server-linux-amd64
-chmod +x signaling-server-linux-amd64
-sudo mv signaling-server-linux-amd64 /usr/local/bin/signaling-server
-
-# Restart service
-sudo systemctl restart selftunnel-signaling
 ```
