@@ -6,20 +6,22 @@ A peer-to-peer mesh VPN that allows you to securely connect multiple devices wit
 
 - **P2P Mesh Networking**: Direct device-to-device connections
 - **NAT Traversal**: UDP hole punching + STUN for connecting through NATs
-- **No IP Public Required**: Only the signaling server needs to be publicly accessible
+- **Relay Fallback**: Automatic relay when direct connection fails (symmetric NAT)
+- **DNS Resolution**: Access peers by name (e.g., `ping myserver.selftunnel`)
+- **No Public IP Required**: Only the signaling server needs to be publicly accessible
 - **WireGuard-based Encryption**: Industry-standard VPN encryption
-- **Cloudflare Workers Signaling**: Free serverless signaling server
+- **Self-hosted Signaling Server**: Lightweight Go server included
 - **Full Mesh Topology**: Every node can connect to every other node
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CLOUDFLARE WORKERS                           │
-│                   (Signaling Server)                            │
+│                    SIGNALING SERVER                              │
+│              (Self-hosted Go server)                             │
 │  • Peer Registration & Discovery                                │
 │  • NAT Traversal Coordination                                   │
-│  • NO traffic relay - only metadata                             │
+│  • Relay fallback for symmetric NAT                             │
 └─────────────────────────────────────────────────────────────────┘
                               │
            ┌──────────────────┼──────────────────┐
@@ -34,19 +36,74 @@ A peer-to-peer mesh VPN that allows you to securely connect multiple devices wit
 
 ## Quick Start
 
-### 1. Deploy Signaling Server (Cloudflare Workers)
+### 1. Deploy Signaling Server
 
+The signaling server is a lightweight Go binary that coordinates peer discovery and provides relay fallback.
+
+**Option A: Download from releases**
 ```bash
-cd worker
-npm install -g wrangler
-wrangler login
+wget https://github.com/asd412id/selftunnel/releases/latest/download/signaling-server-linux-amd64
+chmod +x signaling-server-linux-amd64
+./signaling-server-linux-amd64 --port 8080
+```
 
-# Create KV namespace (Wrangler v3.60+)
-npx wrangler kv namespace create SELFTUNNEL_KV
+**Option B: Build from source**
+```bash
+go build -o signaling-server ./cmd/signaling-server
+./signaling-server --port 8080
+```
 
-# Update wrangler.toml with your KV namespace ID
-# Then deploy
-npx wrangler deploy
+**Option C: Run with systemd**
+```bash
+# Create service file
+sudo tee /etc/systemd/system/selftunnel-signaling.service > /dev/null <<EOF
+[Unit]
+Description=SelfTunnel Signaling Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/signaling-server --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now selftunnel-signaling
+```
+
+**Option D: Run with Docker**
+```bash
+# Build image
+docker build -t selftunnel-signaling -f Dockerfile.signaling .
+
+# Run container
+docker run -d --name signaling -p 8080:8080 selftunnel-signaling
+```
+
+**Reverse Proxy (recommended for production)**
+
+Use nginx or caddy to add HTTPS:
+```nginx
+server {
+    listen 443 ssl;
+    server_name signaling.example.com;
+    
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+}
 ```
 
 ### 2. Download or Build SelfTunnel
@@ -193,7 +250,7 @@ For named instances, config is stored in subdirectory (e.g., `/etc/selftunnel/of
   "virtual_cidr": "10.99.0.0/24",
   "listen_port": 51820,
   "mtu": 1420,
-  "signaling_url": "https://selftunnel-signaling.asdar-binsyam.workers.dev",
+  "signaling_url": "https://signaling.example.com",
   "stun_servers": [
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
@@ -473,7 +530,7 @@ sudo ./install-selftunnel.sh "YOUR_NETWORK_ID" "YOUR_NETWORK_SECRET" "my-ubuntu-
 
 - Go 1.21+ (for building from source)
 - Root/Administrator privileges (for TUN interface)
-- Cloudflare account (for signaling server - free tier sufficient)
+- A server with public IP for signaling server (any VPS works)
 
 ## Platform Support
 
@@ -485,8 +542,7 @@ sudo ./install-selftunnel.sh "YOUR_NETWORK_ID" "YOUR_NETWORK_SECRET" "my-ubuntu-
 
 ## Limitations
 
-- **Symmetric NAT**: May fail to establish direct connection (fallback to relay planned)
-- **Strict Firewalls**: Some corporate firewalls may block UDP traffic
+- **Strict Firewalls**: Some corporate firewalls may block UDP traffic (relay still works over WebSocket)
 
 ## Troubleshooting
 
@@ -525,8 +581,8 @@ sudo modprobe tun
 
 ## Roadmap
 
-- [ ] TURN relay fallback for strict NATs
-- [ ] DNS resolution for peer names
+- [x] ~~TURN relay fallback for strict NATs~~ ✅ Implemented
+- [x] ~~DNS resolution for peer names~~ ✅ Implemented (e.g., `ping myserver.selftunnel`)
 - [ ] Access control lists
 - [ ] Multi-hop routing for partial mesh
 - [ ] Mobile support (iOS/Android)
