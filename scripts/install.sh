@@ -65,7 +65,7 @@ build_selftunnel() {
     cd "$TEMP_DIR"
     
     # Clone repository
-    git clone --depth 1 https://github.com/youruser/selftunnel.git > /dev/null 2>&1 || {
+    git clone --depth 1 https://github.com/asd412id/selftunnel.git > /dev/null 2>&1 || {
         print_warning "Could not clone from GitHub, using local build..."
         # For local testing, copy from current directory
         return 1
@@ -107,7 +107,7 @@ create_systemd_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=SelfTunnel P2P Mesh VPN
-Documentation=https://github.com/youruser/selftunnel
+Documentation=https://github.com/asd412id/selftunnel
 After=network-online.target
 Wants=network-online.target
 

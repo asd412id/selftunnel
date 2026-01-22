@@ -142,7 +142,7 @@ Configuration is stored in `~/.selftunnel/config.json`:
 
 ```bash
 # Download binary (or build from source)
-wget https://github.com/youruser/selftunnel/releases/download/v1.0.0/selftunnel-linux-amd64
+wget https://github.com/asd412id/selftunnel/releases/download/v1.0.0/selftunnel-linux-amd64
 chmod +x selftunnel-linux-amd64
 sudo mv selftunnel-linux-amd64 /usr/local/bin/selftunnel
 
@@ -158,7 +158,7 @@ sudo apt update
 sudo apt install -y golang-go
 
 # Clone and build
-git clone https://github.com/youruser/selftunnel.git
+git clone https://github.com/asd412id/selftunnel.git
 cd selftunnel
 go build -o selftunnel ./cmd/selftunnel
 sudo mv selftunnel /usr/local/bin/
@@ -177,7 +177,7 @@ sudo nano /etc/systemd/system/selftunnel.service
 ```ini
 [Unit]
 Description=SelfTunnel P2P Mesh VPN
-Documentation=https://github.com/youruser/selftunnel
+Documentation=https://github.com/asd412id/selftunnel
 After=network-online.target
 Wants=network-online.target
 
@@ -286,12 +286,12 @@ sudo apt install -y curl
 # Download binary (replace with your release URL)
 echo "Downloading SelfTunnel..."
 # Option 1: Download from releases
-# wget -O /tmp/selftunnel https://github.com/youruser/selftunnel/releases/latest/download/selftunnel-linux-amd64
+# wget -O /tmp/selftunnel https://github.com/asd412id/selftunnel/releases/latest/download/selftunnel-linux-amd64
 
 # Option 2: Build from source
 sudo apt install -y golang-go git
 cd /tmp
-git clone https://github.com/youruser/selftunnel.git || true
+git clone https://github.com/asd412id/selftunnel.git || true
 cd selftunnel
 go build -o selftunnel ./cmd/selftunnel
 sudo mv selftunnel /usr/local/bin/
