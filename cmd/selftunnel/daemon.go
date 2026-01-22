@@ -217,8 +217,8 @@ func (d *Daemon) Status() {
 	}
 }
 
-func RunDaemon() error {
-	cfg, err := config.Load()
+func RunDaemon(instanceName string) error {
+	cfg, err := config.LoadForInstance(instanceName)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}

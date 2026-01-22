@@ -54,11 +54,29 @@ func DefaultConfig() *Config {
 }
 
 func ConfigDir() (string, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	return ConfigDirForInstance("")
+}
+
+func ConfigDirForInstance(instanceName string) (string, error) {
+	var configDir string
+
+	// On Linux/macOS running as root, use /etc/selftunnel
+	// Otherwise use ~/.selftunnel
+	if os.Geteuid() == 0 {
+		configDir = "/etc/selftunnel"
+	} else {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		configDir = filepath.Join(homeDir, ".selftunnel")
 	}
-	configDir := filepath.Join(homeDir, ".selftunnel")
+
+	// If instance name provided, use subdirectory
+	if instanceName != "" {
+		configDir = filepath.Join(configDir, instanceName)
+	}
+
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return "", err
 	}
@@ -66,7 +84,11 @@ func ConfigDir() (string, error) {
 }
 
 func ConfigPath() (string, error) {
-	dir, err := ConfigDir()
+	return ConfigPathForInstance("")
+}
+
+func ConfigPathForInstance(instanceName string) (string, error) {
+	dir, err := ConfigDirForInstance(instanceName)
 	if err != nil {
 		return "", err
 	}
@@ -74,7 +96,11 @@ func ConfigPath() (string, error) {
 }
 
 func Load() (*Config, error) {
-	path, err := ConfigPath()
+	return LoadForInstance("")
+}
+
+func LoadForInstance(instanceName string) (*Config, error) {
+	path, err := ConfigPathForInstance(instanceName)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +122,11 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) Save() error {
-	path, err := ConfigPath()
+	return c.SaveForInstance("")
+}
+
+func (c *Config) SaveForInstance(instanceName string) error {
+	path, err := ConfigPathForInstance(instanceName)
 	if err != nil {
 		return err
 	}

@@ -327,14 +327,20 @@ func peersCmd() *cobra.Command {
 }
 
 func upCmd() *cobra.Command {
-	return &cobra.Command{
+	var instanceName string
+
+	cmd := &cobra.Command{
 		Use:   "up",
 		Short: "Start the SelfTunnel daemon",
 		Long:  "Start the SelfTunnel daemon to establish mesh VPN connections with peers.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return RunDaemon()
+			return RunDaemon(instanceName)
 		},
 	}
+
+	cmd.Flags().StringVar(&instanceName, "instance", "", "Config instance name (for multi-instance setups)")
+
+	return cmd
 }
 
 func generateCmd() *cobra.Command {

@@ -8,6 +8,11 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/selftunnel/selftunnel/internal/config"
+	"github.com/selftunnel/selftunnel/internal/crypto"
+	"github.com/selftunnel/selftunnel/internal/mesh"
+	"github.com/selftunnel/selftunnel/internal/nat"
+	"github.com/selftunnel/selftunnel/internal/signaling"
 	"github.com/spf13/cobra"
 )
 
@@ -54,30 +59,118 @@ func getServiceName(name string) string {
 }
 
 func serviceInstallCmd() *cobra.Command {
-	var name string
+	var (
+		name          string
+		networkID     string
+		networkSecret string
+		nodeName      string
+		signalingURL  string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install SelfTunnel as a system service",
 		Long: `Install SelfTunnel as a system service.
 
-Use --name to create multiple instances with different configurations:
-  selftunnel service install --name office
-  selftunnel service install --name home
+You can setup and install in one command:
+  sudo selftunnel service install --network <ID> --secret <SECRET> --node-name <NAME>
+
+Or use --name to create multiple instances:
+  sudo selftunnel service install --name office --network <ID> --secret <SECRET> --node-name office-pc
 
 This creates services named 'selftunnel-office' and 'selftunnel-home'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			svcName := getServiceName(name)
-			if runtime.GOOS == "windows" {
-				return installWindowsService(svcName)
+			instanceName := name
+
+			// If network credentials provided, setup config first
+			if networkID != "" && networkSecret != "" && nodeName != "" {
+				fmt.Println("Setting up network configuration...")
+				if err := setupNetworkConfig(instanceName, networkID, networkSecret, nodeName, signalingURL); err != nil {
+					return fmt.Errorf("failed to setup network: %w", err)
+				}
+				fmt.Println()
 			}
-			return installLinuxService(svcName)
+
+			if runtime.GOOS == "windows" {
+				return installWindowsService(svcName, instanceName)
+			}
+			return installLinuxService(svcName, instanceName)
 		},
 	}
 
 	cmd.Flags().StringVar(&name, "name", "", "Service instance name (creates 'selftunnel-<name>')")
+	cmd.Flags().StringVar(&networkID, "network", "", "Network ID to join")
+	cmd.Flags().StringVar(&networkSecret, "secret", "", "Network secret")
+	cmd.Flags().StringVar(&nodeName, "node-name", "", "Name for this node")
+	cmd.Flags().StringVar(&signalingURL, "signaling", "", "Signaling server URL (optional)")
 
 	return cmd
+}
+
+// setupNetworkConfig creates config and registers with signaling server
+func setupNetworkConfig(instanceName, networkID, networkSecret, nodeName, signalingURL string) error {
+	cfg := config.DefaultConfig()
+
+	// Generate new key pair
+	keyPair, err := crypto.GenerateKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate keys: %w", err)
+	}
+
+	cfg.NodeName = nodeName
+	cfg.PrivateKey = crypto.ToBase64(keyPair.PrivateKey)
+	cfg.PublicKey = crypto.ToBase64(keyPair.PublicKey)
+	cfg.NetworkID = networkID
+	cfg.NetworkSecret = networkSecret
+	if signalingURL != "" {
+		cfg.SignalingURL = signalingURL
+	}
+
+	// Create hole puncher for NAT traversal
+	hp, err := nat.NewHolePuncherWithPort(cfg.STUNServers, cfg.ListenPort)
+	if err != nil {
+		return fmt.Errorf("failed to create hole puncher: %w", err)
+	}
+	defer hp.Close()
+
+	// Discover public address
+	mapped, err := hp.DiscoverPublicAddr()
+	if err != nil {
+		fmt.Printf("Warning: Could not discover public address: %v\n", err)
+	} else {
+		fmt.Printf("Public endpoint: %s:%d\n", mapped.IP, mapped.Port)
+	}
+
+	// Create local peer
+	localPeer := &mesh.Peer{
+		Name:      cfg.NodeName,
+		PublicKey: cfg.PublicKey,
+		Endpoints: hp.GetEndpoints(),
+	}
+
+	// Connect to signaling server
+	client := signaling.NewClient(cfg.SignalingURL, cfg.NetworkID, cfg.NetworkSecret)
+	client.SetLocalPeer(localPeer)
+
+	// Register with signaling server
+	resp, err := client.Register()
+	if err != nil {
+		return fmt.Errorf("failed to register with network: %w", err)
+	}
+
+	cfg.VirtualIP = resp.VirtualIP
+	fmt.Printf("Registered with network. Virtual IP: %s\n", cfg.VirtualIP)
+
+	// Save config
+	if err := cfg.SaveForInstance(instanceName); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	configPath, _ := config.ConfigPathForInstance(instanceName)
+	fmt.Printf("Config saved to: %s\n", configPath)
+
+	return nil
 }
 
 func serviceUninstallCmd() *cobra.Command {
@@ -216,10 +309,19 @@ func serviceLogsCmd() *cobra.Command {
 	return cmd
 }
 
-func installLinuxService(svcName string) error {
+func installLinuxService(svcName, instanceName string) error {
 	// Check if running as root
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("this command must be run as root (use sudo)")
+	}
+
+	// Check if config exists
+	configPath, err := config.ConfigPathForInstance(instanceName)
+	if err != nil {
+		return fmt.Errorf("failed to get config path: %w", err)
+	}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("config not found at %s. Run 'selftunnel join' first or provide --network, --secret, --node-name flags", configPath)
 	}
 
 	// Get the path to the current executable
@@ -247,6 +349,12 @@ func installLinuxService(svcName string) error {
 		}
 	}
 
+	// Build ExecStart command with instance name if needed
+	execStart := fmt.Sprintf("%s up", targetPath)
+	if instanceName != "" {
+		execStart = fmt.Sprintf("%s up --instance %s", targetPath, instanceName)
+	}
+
 	// Create systemd service file
 	serviceContent := fmt.Sprintf(`[Unit]
 Description=%s
@@ -257,7 +365,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=%s up
+ExecStart=%s
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -274,7 +382,7 @@ ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
-`, serviceDescription, targetPath, svcName)
+`, serviceDescription, execStart, svcName)
 
 	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", svcName)
 	fmt.Printf("Creating service file at %s...\n", servicePath)
@@ -356,7 +464,16 @@ func uninstallLinuxService(svcName string) error {
 	return nil
 }
 
-func installWindowsService(svcName string) error {
+func installWindowsService(svcName, instanceName string) error {
+	// Check if config exists
+	configPath, err := config.ConfigPathForInstance(instanceName)
+	if err != nil {
+		return fmt.Errorf("failed to get config path: %w", err)
+	}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("config not found at %s. Run 'selftunnel join' first or provide --network, --secret, --node-name flags", configPath)
+	}
+
 	// Get the path to the current executable
 	execPath, err := os.Executable()
 	if err != nil {
@@ -370,8 +487,11 @@ func installWindowsService(svcName string) error {
 	// Create the service using sc.exe
 	fmt.Printf("Creating Windows service '%s'...\n", svcName)
 
-	// sc create selftunnel binPath= "C:\path\to\selftunnel.exe up" start= auto
+	// Build binPath with instance name if needed
 	binPath := fmt.Sprintf("\"%s\" up", execPath)
+	if instanceName != "" {
+		binPath = fmt.Sprintf("\"%s\" up --instance %s", execPath, instanceName)
+	}
 
 	displayName := serviceDescription
 	if svcName != defaultServiceName {

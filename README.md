@@ -49,21 +49,27 @@ npx wrangler kv namespace create SELFTUNNEL_KV
 npx wrangler deploy
 ```
 
-### 2. Build SelfTunnel
+### 2. Download or Build SelfTunnel
 
+**Option A: Download from releases**
+```bash
+# Linux
+wget https://github.com/asd412id/selftunnel/releases/latest/download/selftunnel-linux-amd64
+chmod +x selftunnel-linux-amd64
+sudo mv selftunnel-linux-amd64 /usr/local/bin/selftunnel
+
+# Windows - download selftunnel-windows-amd64.exe
+```
+
+**Option B: Build from source**
 ```bash
 go build -o selftunnel ./cmd/selftunnel
-
-# Or for specific platforms
-GOOS=linux GOARCH=amd64 go build -o selftunnel-linux ./cmd/selftunnel
-GOOS=darwin GOARCH=amd64 go build -o selftunnel-mac ./cmd/selftunnel
-GOOS=windows GOARCH=amd64 go build -o selftunnel.exe ./cmd/selftunnel
 ```
 
 ### 3. Initialize a New Network (First Node)
 
 ```bash
-./selftunnel init --name "my-laptop"
+selftunnel init --name "my-laptop"
 ```
 
 This will output:
@@ -77,20 +83,40 @@ Public Key:     pubkey123...
 Share the Network ID and Secret with other peers to join this network.
 ```
 
-### 4. Join the Network (Other Nodes)
+### 4. Join & Install as Service (Other Nodes) - Recommended
 
+**One-command setup and install:**
 ```bash
-./selftunnel join \
+# Linux/macOS
+sudo selftunnel service install \
   --network "abc123xyz..." \
   --secret "secret123..." \
-  --name "my-server"
+  --node-name "my-server"
+
+sudo selftunnel service start
+
+# Windows (Run as Administrator)
+selftunnel service install --network "abc123xyz..." --secret "secret123..." --node-name "my-server"
+selftunnel service start
 ```
 
-### 5. Start the Tunnel
+**Or step by step:**
+```bash
+# Step 1: Join network (creates config)
+selftunnel join --network "abc123xyz..." --secret "secret123..." --name "my-server"
+
+# Step 2: Install service
+sudo selftunnel service install
+
+# Step 3: Start service
+sudo selftunnel service start
+```
+
+### 5. Manual Mode (without service)
 
 ```bash
 # Run as administrator/root for TUN interface
-sudo ./selftunnel up
+sudo selftunnel up
 ```
 
 ### 6. Connect via SSH
@@ -111,16 +137,50 @@ ssh user@10.99.0.2
 | `selftunnel peers` | List all peers in the network |
 | `selftunnel leave` | Leave the current network |
 | `selftunnel generate keys` | Generate a new key pair |
+
+### Service Commands
+
+| Command | Description |
+|---------|-------------|
 | `selftunnel service install` | Install as system service |
+| `selftunnel service install --network <id> --secret <secret> --node-name <name>` | Setup + install in one command |
+| `selftunnel service install --name <instance>` | Install named instance (multi-network) |
 | `selftunnel service uninstall` | Remove system service |
 | `selftunnel service start` | Start the service |
 | `selftunnel service stop` | Stop the service |
+| `selftunnel service restart` | Restart the service |
 | `selftunnel service status` | Show service status |
 | `selftunnel service logs` | Show service logs |
+| `selftunnel service logs -f` | Follow service logs |
+
+### Multi-Instance Support
+
+Run multiple VPN networks on the same machine:
+
+```bash
+# Install first network
+sudo selftunnel service install --name office \
+  --network "OFFICE_NET_ID" --secret "OFFICE_SECRET" --node-name "my-pc-office"
+
+# Install second network  
+sudo selftunnel service install --name home \
+  --network "HOME_NET_ID" --secret "HOME_SECRET" --node-name "my-pc-home"
+
+# Manage each instance
+sudo selftunnel service start --name office
+sudo selftunnel service start --name home
+sudo selftunnel service status --name office
+sudo selftunnel service logs --name home -f
+```
 
 ## Configuration
 
-Configuration is stored in `~/.selftunnel/config.json`:
+Configuration is stored in:
+- **Linux/macOS (root)**: `/etc/selftunnel/config.json`
+- **Linux/macOS (user)**: `~/.selftunnel/config.json`
+- **Windows**: `%USERPROFILE%\.selftunnel\config.json`
+
+For named instances, config is stored in subdirectory (e.g., `/etc/selftunnel/office/config.json`).
 
 ```json
 {
@@ -144,23 +204,28 @@ Configuration is stored in `~/.selftunnel/config.json`:
 
 ## Deploy to Ubuntu Server
 
-### Method 1: Quick Install
+### Quick Install (Recommended)
 
 ```bash
-# Download binary (or build from source)
-wget https://github.com/asd412id/selftunnel/releases/download/v1.0.0/selftunnel-linux-amd64
+# Download binary
+wget https://github.com/asd412id/selftunnel/releases/latest/download/selftunnel-linux-amd64
 chmod +x selftunnel-linux-amd64
 sudo mv selftunnel-linux-amd64 /usr/local/bin/selftunnel
 
-# Join network
-selftunnel join --network "YOUR_NETWORK_ID" --secret "YOUR_SECRET" --name "ubuntu-server"
+# Setup + install service in one command
+sudo selftunnel service install \
+  --network "YOUR_NETWORK_ID" \
+  --secret "YOUR_SECRET" \
+  --node-name "ubuntu-server"
 
-# Install as service (recommended)
-sudo selftunnel service install
+# Start service
 sudo selftunnel service start
+
+# Check status
+sudo selftunnel service status
 ```
 
-### Method 2: Build from Source
+### Build from Source
 
 ```bash
 # Install Go (if not installed)
@@ -173,8 +238,12 @@ cd selftunnel
 go build -o selftunnel ./cmd/selftunnel
 sudo mv selftunnel /usr/local/bin/
 
-# Install and start service
-sudo selftunnel service install
+# Setup + install service
+sudo selftunnel service install \
+  --network "YOUR_NETWORK_ID" \
+  --secret "YOUR_SECRET" \
+  --node-name "ubuntu-server"
+
 sudo selftunnel service start
 ```
 
