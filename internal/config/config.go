@@ -11,9 +11,9 @@ const (
 	DefaultMTU          = 1420
 	DefaultKeepalive    = 25
 	DefaultVirtualCIDR  = "10.99.0.0/24"
-	DefaultSignalingURL = "https://selftunnel-signaling.asdar-binsyam.workers.dev"
-	DefaultDNSPort      = 5353
-	DefaultDNSSuffix    = "selftunnel"
+	DefaultSignalingURL = "https://selftunnel.maccaqe.id"
+	DefaultDNSPort      = 53530
+	DefaultDNSSuffix    = "mesh"
 )
 
 type Config struct {

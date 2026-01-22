@@ -20,6 +20,7 @@ const (
 type STUNClient struct {
 	servers []string
 	timeout time.Duration
+	conn    *net.UDPConn // shared connection (optional)
 }
 
 type MappedAddress struct {
@@ -34,17 +35,56 @@ func NewSTUNClient(servers []string) *STUNClient {
 	}
 }
 
+// SetConn sets a shared UDP connection for STUN queries
+func (c *STUNClient) SetConn(conn *net.UDPConn) {
+	c.conn = conn
+}
+
 // GetMappedAddress queries STUN servers to get the public IP and port
 func (c *STUNClient) GetMappedAddress(localAddr *net.UDPAddr) (*MappedAddress, error) {
-	var lastErr error
+	if len(c.servers) == 0 {
+		return nil, errors.New("no STUN servers configured")
+	}
+
+	// If using shared connection, query sequentially to avoid read conflicts
+	if c.conn != nil {
+		var lastErr error
+		for _, server := range c.servers {
+			addr, err := c.queryServer(server, localAddr)
+			if err == nil {
+				return addr, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, fmt.Errorf("all STUN servers failed: %w", lastErr)
+		}
+		return nil, errors.New("no STUN servers configured")
+	}
+
+	// Query servers in parallel when using separate connections
+	type result struct {
+		addr *MappedAddress
+		err  error
+	}
+
+	results := make(chan result, len(c.servers))
 
 	for _, server := range c.servers {
-		addr, err := c.queryServer(server, localAddr)
-		if err != nil {
-			lastErr = err
-			continue
+		go func(srv string) {
+			addr, err := c.queryServer(srv, localAddr)
+			results <- result{addr, err}
+		}(server)
+	}
+
+	// Wait for first successful result or all failures
+	var lastErr error
+	for i := 0; i < len(c.servers); i++ {
+		res := <-results
+		if res.err == nil {
+			return res.addr, nil
 		}
-		return addr, nil
+		lastErr = res.err
 	}
 
 	if lastErr != nil {
@@ -66,7 +106,34 @@ func (c *STUNClient) queryServer(server string, localAddr *net.UDPAddr) (*Mapped
 		return nil, fmt.Errorf("failed to resolve STUN server: %w", err)
 	}
 
-	// Create UDP connection from local address
+	// Build STUN binding request
+	request := buildBindingRequest()
+
+	// Use shared connection if available
+	if c.conn != nil {
+		// Use WriteToUDP/ReadFromUDP for shared connection
+		c.conn.SetWriteDeadline(time.Now().Add(c.timeout))
+		if _, err := c.conn.WriteToUDP(request, serverAddr); err != nil {
+			return nil, fmt.Errorf("failed to send STUN request: %w", err)
+		}
+
+		// Read response
+		response := make([]byte, 1024)
+		c.conn.SetReadDeadline(time.Now().Add(c.timeout))
+		n, fromAddr, err := c.conn.ReadFromUDP(response)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read STUN response: %w", err)
+		}
+
+		// Verify response is from STUN server
+		if !fromAddr.IP.Equal(serverAddr.IP) {
+			return nil, fmt.Errorf("response from unexpected address: %v", fromAddr)
+		}
+
+		return parseBindingResponse(response[:n], request[8:20])
+	}
+
+	// Create new UDP connection if no shared connection
 	var conn *net.UDPConn
 	if localAddr != nil {
 		conn, err = net.DialUDP("udp", localAddr, serverAddr)
@@ -79,9 +146,6 @@ func (c *STUNClient) queryServer(server string, localAddr *net.UDPAddr) (*Mapped
 	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(c.timeout))
-
-	// Build STUN binding request
-	request := buildBindingRequest()
 
 	// Send request
 	if _, err := conn.Write(request); err != nil {

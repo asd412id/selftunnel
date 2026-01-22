@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -19,44 +20,71 @@ const (
 	WGCookieReply   = 3
 )
 
+// RelaySender interface for sending data via relay
+type RelaySender interface {
+	Send(to string, data []byte) error
+	IsConnected() bool
+}
+
 type WireGuardTunnel struct {
-	tun        *TUNDevice
-	privateKey [crypto.KeySize]byte
-	publicKey  [crypto.KeySize]byte
-	listenPort int
-	conn       *net.UDPConn
-	peers      map[string]*WGPeer
-	peersMu    sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	tun             *TUNDevice
+	privateKey      [crypto.KeySize]byte
+	publicKey       [crypto.KeySize]byte
+	listenPort      int
+	conn            *net.UDPConn
+	ownConn         bool // true if we created the conn and should close it
+	peers           map[string]*WGPeer
+	peersMu         sync.RWMutex
+	relay           RelaySender
+	relayMu         sync.RWMutex
+	onPunchPacket   func(addr *net.UDPAddr)                  // callback when punch packet received
+	onDataReceived  func(publicKeyB64 string, isDirect bool) // callback when data received from peer
+	onNeedReconnect func(publicKeyB64 string)                // callback when peer needs reconnection attempt
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 type WGPeer struct {
-	PublicKey    [crypto.KeySize]byte
-	Endpoint     *net.UDPAddr
-	AllowedIPs   []*net.IPNet
-	LastSeen     time.Time
-	TxBytes      uint64
-	RxBytes      uint64
-	Keepalive    time.Duration
-	sharedSecret [crypto.KeySize]byte
-	mu           sync.RWMutex
+	PublicKey     [crypto.KeySize]byte
+	PublicKeyB64  string // base64 encoded public key for relay lookup
+	Endpoint      *net.UDPAddr
+	AllowedIPs    []*net.IPNet
+	LastSeen      time.Time
+	TxBytes       uint64
+	RxBytes       uint64
+	Keepalive     time.Duration
+	sharedSecret  [crypto.KeySize]byte
+	relayFallback bool // true if using relay instead of direct UDP
+	mu            sync.RWMutex
 }
 
 type WireGuardConfig struct {
 	TUN        *TUNDevice
 	PrivateKey [crypto.KeySize]byte
 	ListenPort int
+	Conn       *net.UDPConn // optional: shared UDP connection
 }
 
 func NewWireGuardTunnel(cfg WireGuardConfig) (*WireGuardTunnel, error) {
 	publicKey := crypto.PublicKeyFromPrivate(cfg.PrivateKey)
 
-	addr := &net.UDPAddr{Port: cfg.ListenPort}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on UDP port %d: %w", cfg.ListenPort, err)
+	var conn *net.UDPConn
+	var ownConn bool
+	var err error
+
+	if cfg.Conn != nil {
+		// Use provided shared connection
+		conn = cfg.Conn
+		ownConn = false
+	} else {
+		// Create our own UDP connection - use udp4 for IPv4 only
+		addr := &net.UDPAddr{IP: net.IPv4zero, Port: cfg.ListenPort}
+		conn, err = net.ListenUDP("udp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to listen on UDP port %d: %w", cfg.ListenPort, err)
+		}
+		ownConn = true
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -67,6 +95,7 @@ func NewWireGuardTunnel(cfg WireGuardConfig) (*WireGuardTunnel, error) {
 		publicKey:  publicKey,
 		listenPort: cfg.ListenPort,
 		conn:       conn,
+		ownConn:    ownConn,
 		peers:      make(map[string]*WGPeer),
 		ctx:        ctx,
 		cancel:     cancel,
@@ -75,8 +104,23 @@ func NewWireGuardTunnel(cfg WireGuardConfig) (*WireGuardTunnel, error) {
 	return wg, nil
 }
 
+// SetPunchCallback sets the callback for when punch packet is received
+func (wg *WireGuardTunnel) SetPunchCallback(callback func(addr *net.UDPAddr)) {
+	wg.onPunchPacket = callback
+}
+
+// SetDataReceivedCallback sets the callback for when data is received from peer
+func (wg *WireGuardTunnel) SetDataReceivedCallback(callback func(publicKeyB64 string, isDirect bool)) {
+	wg.onDataReceived = callback
+}
+
+// SetNeedReconnectCallback sets the callback for when peer needs reconnection
+func (wg *WireGuardTunnel) SetNeedReconnectCallback(callback func(publicKeyB64 string)) {
+	wg.onNeedReconnect = callback
+}
+
 // AddPeer adds a new peer to the tunnel
-func (wg *WireGuardTunnel) AddPeer(publicKey [crypto.KeySize]byte, endpoint string, allowedIPs []string) error {
+func (wg *WireGuardTunnel) AddPeer(publicKey [crypto.KeySize]byte, endpoint string, allowedIPs []string, publicKeyB64 string) error {
 	var endpointAddr *net.UDPAddr
 	var err error
 
@@ -103,18 +147,24 @@ func (wg *WireGuardTunnel) AddPeer(publicKey [crypto.KeySize]byte, endpoint stri
 		return fmt.Errorf("failed to compute shared secret: %w", err)
 	}
 
-	peer := &WGPeer{
-		PublicKey:    publicKey,
-		Endpoint:     endpointAddr,
-		AllowedIPs:   allowed,
-		Keepalive:    WGKeepalive,
-		sharedSecret: sharedSecret,
+	// Use provided publicKeyB64 or generate from publicKey
+	keyB64 := publicKeyB64
+	if keyB64 == "" {
+		keyB64 = crypto.ToBase64(publicKey)
 	}
 
-	key := crypto.ToBase64(publicKey)
+	peer := &WGPeer{
+		PublicKey:     publicKey,
+		PublicKeyB64:  keyB64,
+		Endpoint:      endpointAddr,
+		AllowedIPs:    allowed,
+		Keepalive:     WGKeepalive,
+		sharedSecret:  sharedSecret,
+		relayFallback: true, // ALWAYS start with relay - disable only when direct is proven to work
+	}
 
 	wg.peersMu.Lock()
-	wg.peers[key] = peer
+	wg.peers[keyB64] = peer
 	wg.peersMu.Unlock()
 
 	return nil
@@ -128,7 +178,7 @@ func (wg *WireGuardTunnel) RemovePeer(publicKey [crypto.KeySize]byte) {
 	wg.peersMu.Unlock()
 }
 
-// UpdatePeerEndpoint updates a peer's endpoint
+// UpdatePeerEndpoint updates a peer's endpoint (keeps relay enabled until direct is proven)
 func (wg *WireGuardTunnel) UpdatePeerEndpoint(publicKey [crypto.KeySize]byte, endpoint string) error {
 	key := crypto.ToBase64(publicKey)
 
@@ -140,8 +190,24 @@ func (wg *WireGuardTunnel) UpdatePeerEndpoint(publicKey [crypto.KeySize]byte, en
 	wg.peersMu.Lock()
 	if peer, ok := wg.peers[key]; ok {
 		peer.mu.Lock()
+		oldEndpoint := peer.Endpoint
 		peer.Endpoint = endpointAddr
+		// DON'T disable relay here - keep it enabled until we receive actual data via direct
+		// peer.relayFallback stays true, will be set to false in handleDataPacket when data arrives
 		peer.mu.Unlock()
+
+		if oldEndpoint == nil {
+			log.Printf("[WG] Set endpoint for %s to %s (trying direct, relay still active)", key[:16], endpoint)
+		} else if oldEndpoint.String() != endpoint {
+			log.Printf("[WG] Updated endpoint for %s: %s -> %s", key[:16], oldEndpoint, endpoint)
+		}
+
+		// Send keepalive to try establishing direct path
+		go func() {
+			keepalivePacket := make([]byte, WGHeaderSize)
+			keepalivePacket[0] = WGDataPacket
+			wg.conn.WriteToUDP(keepalivePacket, endpointAddr)
+		}()
 	}
 	wg.peersMu.Unlock()
 
@@ -168,9 +234,57 @@ func (wg *WireGuardTunnel) Start() error {
 // Stop stops the WireGuard tunnel
 func (wg *WireGuardTunnel) Stop() {
 	wg.cancel()
-	wg.conn.Close()
+	if wg.ownConn {
+		wg.conn.Close()
+	}
 	wg.tun.Close()
 	wg.wg.Wait()
+}
+
+// SetRelay sets the relay sender for fallback communication
+func (wg *WireGuardTunnel) SetRelay(relay RelaySender) {
+	wg.relayMu.Lock()
+	wg.relay = relay
+	wg.relayMu.Unlock()
+}
+
+// WriteFromRelay handles data received from relay
+func (wg *WireGuardTunnel) WriteFromRelay(from string, data []byte) {
+	// Find the peer by public key
+	wg.peersMu.RLock()
+	peer, exists := wg.peers[from]
+	wg.peersMu.RUnlock()
+
+	if !exists {
+		log.Printf("[Relay] Received data from unknown peer: %s (have %d peers)", from[:16], len(wg.peers))
+		return
+	}
+
+	// Decrypt the packet using XOR with shared secret
+	decrypted := wg.decryptWithSecret(data, peer.sharedSecret)
+	if decrypted == nil {
+		log.Printf("[Relay] Failed to decrypt data from %s", from[:16])
+		return
+	}
+
+	// Write to TUN
+	n, err := wg.tun.Write(decrypted)
+	if err != nil {
+		log.Printf("[Relay] Failed to write to TUN: %v", err)
+		return
+	}
+	log.Printf("[Relay] Received %d bytes from %s, wrote %d to TUN", len(data), from[:16], n)
+
+	// Update peer stats
+	peer.mu.Lock()
+	peer.RxBytes += uint64(len(decrypted))
+	peer.LastSeen = time.Now()
+	peer.mu.Unlock()
+
+	// Notify callback that we received data from this peer (via relay)
+	if wg.onDataReceived != nil {
+		wg.onDataReceived(from, false)
+	}
 }
 
 func (wg *WireGuardTunnel) tunReader() {
@@ -212,7 +326,9 @@ func (wg *WireGuardTunnel) udpReader() {
 		default:
 		}
 
+		// Only set read deadline, not affecting write
 		wg.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		wg.conn.SetWriteDeadline(time.Time{}) // Clear write deadline
 		n, addr, err := wg.conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -238,12 +354,50 @@ func (wg *WireGuardTunnel) keepaliveSender() {
 	ticker := time.NewTicker(WGKeepalive)
 	defer ticker.Stop()
 
+	healthCheckTicker := time.NewTicker(10 * time.Second)
+	defer healthCheckTicker.Stop()
+
 	for {
 		select {
 		case <-wg.ctx.Done():
 			return
 		case <-ticker.C:
 			wg.sendKeepalives()
+		case <-healthCheckTicker.C:
+			wg.checkPeerHealth()
+		}
+	}
+}
+
+// checkPeerHealth monitors peer connections and enables relay fallback if direct connection is stale
+func (wg *WireGuardTunnel) checkPeerHealth() {
+	wg.peersMu.RLock()
+	defer wg.peersMu.RUnlock()
+
+	for _, peer := range wg.peers {
+		peer.mu.Lock()
+		lastSeen := peer.LastSeen
+		wasUsingRelay := peer.relayFallback
+		hasEndpoint := peer.Endpoint != nil
+		peerKey := peer.PublicKeyB64
+
+		needReconnect := false
+
+		// If we have a direct endpoint but haven't received data in 30+ seconds,
+		// enable relay fallback (connection might be broken)
+		if hasEndpoint && !wasUsingRelay && !lastSeen.IsZero() {
+			if time.Since(lastSeen) > 30*time.Second {
+				peer.relayFallback = true
+				needReconnect = true
+				log.Printf("[Health] Peer %s direct connection stale (last seen %v ago), enabling relay fallback", peerKey[:16], time.Since(lastSeen))
+			}
+		}
+
+		peer.mu.Unlock()
+
+		// Trigger reconnection attempt outside of lock
+		if needReconnect && wg.onNeedReconnect != nil {
+			go wg.onNeedReconnect(peerKey)
 		}
 	}
 }
@@ -270,27 +424,78 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 		return
 	}
 
-	peer.mu.RLock()
-	endpoint := peer.Endpoint
-	peer.mu.RUnlock()
-
-	if endpoint == nil {
-		return
-	}
-
-	// In a real implementation, we would encrypt the packet here
-	// For now, we send it with a simple header
+	// Encrypt the packet
 	encrypted := wg.encryptPacket(packet, peer)
 
-	wg.conn.WriteToUDP(encrypted, endpoint)
+	// Get peer connection info with lock
+	peer.mu.RLock()
+	endpoint := peer.Endpoint
+	useRelay := peer.relayFallback
+	peerKey := peer.PublicKeyB64
+	peer.mu.RUnlock()
 
-	peer.mu.Lock()
-	peer.TxBytes += uint64(len(packet))
-	peer.mu.Unlock()
+	directSent := false
+	relaySent := false
+
+	// Try direct UDP if we have an endpoint
+	if endpoint != nil {
+		wg.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		_, err := wg.conn.WriteToUDP(encrypted, endpoint)
+		wg.conn.SetWriteDeadline(time.Time{})
+		if err == nil {
+			directSent = true
+			peer.mu.Lock()
+			peer.TxBytes += uint64(len(packet))
+			peer.mu.Unlock()
+		}
+	}
+
+	// ALWAYS use relay as backup when:
+	// - relayFallback is true (direct not yet proven), OR
+	// - No endpoint available, OR
+	// - Direct send failed
+	wg.relayMu.RLock()
+	relay := wg.relay
+	wg.relayMu.RUnlock()
+
+	if relay != nil && relay.IsConnected() && peerKey != "" {
+		// Use relay if: no direct endpoint, direct failed, or relay mode is active
+		if endpoint == nil || !directSent || useRelay {
+			if err := relay.Send(peerKey, encrypted); err == nil {
+				relaySent = true
+				if !directSent {
+					peer.mu.Lock()
+					peer.TxBytes += uint64(len(packet))
+					peer.mu.Unlock()
+				}
+			} else {
+				log.Printf("[Relay] Send failed: %v (packet size: %d)", err, len(encrypted))
+			}
+		}
+	}
+
+	// Debug logging for non-ICMP large packets (like SSH)
+	if !directSent && !relaySent {
+		log.Printf("[WG] FAILED to send %d byte packet to %s", len(packet), dstIP)
+	}
 }
 
 func (wg *WireGuardTunnel) handleInbound(packet []byte, addr *net.UDPAddr) {
 	if len(packet) < 4 {
+		return
+	}
+
+	// Check for punch packet first (before WireGuard processing)
+	if len(packet) >= 16 && string(packet[:16]) == "SELFTUNNEL_PUNCH" {
+		// Don't log every punch packet - too spammy
+		if wg.onPunchPacket != nil {
+			wg.onPunchPacket(addr)
+		}
+		// Send punch response back
+		wg.conn.WriteToUDP(packet, addr)
+
+		// Update peer that matches this address to use direct connection
+		wg.updatePeerFromPunch(addr)
 		return
 	}
 
@@ -309,6 +514,43 @@ func (wg *WireGuardTunnel) handleInbound(packet []byte, addr *net.UDPAddr) {
 	}
 }
 
+// updatePeerFromPunch updates peer endpoint when receiving punch from unknown address
+func (wg *WireGuardTunnel) updatePeerFromPunch(addr *net.UDPAddr) {
+	// Skip virtual IPs and private IPs
+	ip4 := addr.IP.To4()
+	if ip4 == nil {
+		return
+	}
+	if ip4[0] == 10 || (ip4[0] == 192 && ip4[1] == 168) || (ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) || ip4[0] == 127 {
+		return
+	}
+
+	wg.peersMu.Lock()
+	defer wg.peersMu.Unlock()
+
+	for _, peer := range wg.peers {
+		peer.mu.Lock()
+		// Update if peer has no endpoint, is using relay, or endpoint doesn't match
+		needUpdate := peer.Endpoint == nil || peer.relayFallback
+		if needUpdate {
+			oldEndpoint := peer.Endpoint
+			peer.Endpoint = addr
+			peer.relayFallback = false
+			peer.LastSeen = time.Now()
+			if oldEndpoint == nil {
+				log.Printf("[WG] Peer %s: endpoint set to %s (direct ENABLED)", peer.PublicKeyB64[:16], addr)
+			} else {
+				log.Printf("[WG] Peer %s: endpoint %s -> %s (direct ENABLED)", peer.PublicKeyB64[:16], oldEndpoint, addr)
+			}
+		} else if peer.Endpoint != nil && peer.Endpoint.String() != addr.String() {
+			// Different endpoint - NAT rebinding, update silently
+			peer.Endpoint = addr
+			peer.LastSeen = time.Now()
+		}
+		peer.mu.Unlock()
+	}
+}
+
 func (wg *WireGuardTunnel) handleHandshakeInit(packet []byte, addr *net.UDPAddr) {
 	// Simplified handshake - in production use full Noise protocol
 }
@@ -323,38 +565,92 @@ func (wg *WireGuardTunnel) handleDataPacket(packet []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	decrypted := wg.decryptPacket(packet)
-	if decrypted == nil {
+	// Find peer by endpoint first to get shared secret for decryption
+	peer := wg.findPeerByEndpoint(addr)
+	if peer == nil {
+		// Try to find any peer that might match (for new connections)
+		wg.peersMu.RLock()
+		for _, p := range wg.peers {
+			p.mu.RLock()
+			// Accept from any peer that is using relay or has no endpoint
+			if p.relayFallback || p.Endpoint == nil {
+				peer = p
+				p.mu.RUnlock()
+				break
+			}
+			p.mu.RUnlock()
+		}
+		wg.peersMu.RUnlock()
+	}
+
+	if peer == nil {
+		log.Printf("[WG] Received data from unknown endpoint %s, no matching peer", addr)
 		return
 	}
 
-	wg.tun.Write(decrypted)
+	// Decrypt with peer's shared secret
+	decrypted := wg.decryptWithSecret(packet, peer.sharedSecret)
+	if decrypted == nil || len(decrypted) < 20 {
+		return
+	}
 
-	// Update peer stats
-	peer := wg.findPeerByEndpoint(addr)
-	if peer != nil {
-		peer.mu.Lock()
-		peer.RxBytes += uint64(len(decrypted))
-		peer.LastSeen = time.Now()
-		peer.mu.Unlock()
+	// Write to TUN
+	n, err := wg.tun.Write(decrypted)
+	if err != nil {
+		log.Printf("[WG] Failed to write to TUN: %v", err)
+		return
+	}
+
+	// Update peer stats and endpoint
+	peer.mu.Lock()
+	peer.RxBytes += uint64(len(decrypted))
+	peer.LastSeen = time.Now()
+	peerKeyB64 := peer.PublicKeyB64
+
+	// Update endpoint if changed
+	if peer.Endpoint == nil || peer.Endpoint.String() != addr.String() {
+		peer.Endpoint = addr
+	}
+
+	// Direct connection confirmed working - disable relay fallback
+	if peer.relayFallback {
+		peer.relayFallback = false
+		log.Printf("[Direct] Data received from %s (%d bytes), relay DISABLED", addr, n)
+	}
+	peer.mu.Unlock()
+
+	// Notify callback that we received data from this peer (direct connection)
+	if wg.onDataReceived != nil {
+		wg.onDataReceived(peerKeyB64, true)
 	}
 }
 
 func (wg *WireGuardTunnel) encryptPacket(plaintext []byte, peer *WGPeer) []byte {
-	// Simplified encryption - in production use ChaCha20-Poly1305
-	// This is a placeholder that just prepends a header
+	// XOR encryption with shared secret
 	result := make([]byte, WGHeaderSize+len(plaintext))
 	result[0] = WGDataPacket
-	copy(result[WGHeaderSize:], plaintext)
+
+	// XOR plaintext with shared secret
+	for i := 0; i < len(plaintext); i++ {
+		result[WGHeaderSize+i] = plaintext[i] ^ peer.sharedSecret[i%len(peer.sharedSecret)]
+	}
 	return result
 }
 
-func (wg *WireGuardTunnel) decryptPacket(ciphertext []byte) []byte {
-	// Simplified decryption - in production use ChaCha20-Poly1305
-	if len(ciphertext) <= WGHeaderSize {
+// decryptWithSecret decrypts data using XOR with shared secret
+func (wg *WireGuardTunnel) decryptWithSecret(data []byte, secret [crypto.KeySize]byte) []byte {
+	if len(data) <= WGHeaderSize {
 		return nil
 	}
-	return ciphertext[WGHeaderSize:]
+
+	ciphertext := data[WGHeaderSize:]
+	plaintext := make([]byte, len(ciphertext))
+
+	// XOR ciphertext with shared secret
+	for i := 0; i < len(ciphertext); i++ {
+		plaintext[i] = ciphertext[i] ^ secret[i%len(secret)]
+	}
+	return plaintext
 }
 
 func (wg *WireGuardTunnel) findPeerForIP(ip net.IP) *WGPeer {

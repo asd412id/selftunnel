@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -142,16 +141,19 @@ func (pm *PeerManager) GetPeerByIP(ip string) *Peer {
 	return pm.peersByIP[ip]
 }
 
-// GetPeerByName returns a peer by name (case-insensitive)
+// GetPeerByName returns a peer by name
 func (pm *PeerManager) GetPeerByName(name string) *Peer {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	name = strings.ToLower(name)
 	for _, peer := range pm.peers {
-		if strings.ToLower(peer.Name) == name {
+		if peer.Name == name {
 			return peer
 		}
+	}
+	// Also check local peer
+	if pm.localPeer != nil && pm.localPeer.Name == name {
+		return pm.localPeer
 	}
 	return nil
 }
@@ -255,6 +257,51 @@ func (pm *PeerManager) UpdateFromSignaling(peersData []byte) error {
 // Close closes the peer manager
 func (pm *PeerManager) Close() {
 	pm.cancel()
+}
+
+// SetEndpoints safely updates a peer's endpoints
+func (p *Peer) SetEndpoints(endpoints []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Endpoints = endpoints
+}
+
+// GetEndpoints safely gets a peer's endpoints
+func (p *Peer) GetEndpoints() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.Endpoints
+}
+
+// UpdateLastSeen updates the peer's last seen time and optionally sets state to connected
+func (p *Peer) UpdateLastSeen(setConnected bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.LastSeen = time.Now()
+	if setConnected && p.State != PeerStateConnected {
+		p.State = PeerStateConnected
+	}
+}
+
+// GetLastSeen safely gets the peer's last seen time
+func (p *Peer) GetLastSeen() time.Time {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.LastSeen
+}
+
+// GetState safely gets the peer's state
+func (p *Peer) GetState() PeerState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.State
+}
+
+// SetState safely sets the peer's state
+func (p *Peer) SetState(state PeerState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.State = state
 }
 
 // NewPeerFromKeys creates a new peer from key pair

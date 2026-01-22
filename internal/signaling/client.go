@@ -38,8 +38,28 @@ type RegisterResponse struct {
 	Message   string `json:"message,omitempty"`
 }
 
+// SignalingPeer represents peer data from signaling server
+type SignalingPeer struct {
+	Name      string   `json:"name"`
+	PublicKey string   `json:"public_key"`
+	VirtualIP string   `json:"virtual_ip"`
+	Endpoints []string `json:"endpoints"`
+	LastSeen  int64    `json:"last_seen"` // Unix timestamp ms
+}
+
+// ToMeshPeer converts SignalingPeer to mesh.Peer
+func (sp *SignalingPeer) ToMeshPeer() *mesh.Peer {
+	return &mesh.Peer{
+		Name:      sp.Name,
+		PublicKey: sp.PublicKey,
+		VirtualIP: sp.VirtualIP,
+		Endpoints: sp.Endpoints,
+		LastSeen:  time.UnixMilli(sp.LastSeen),
+	}
+}
+
 type PeersResponse struct {
-	Peers []*mesh.Peer `json:"peers"`
+	Peers []SignalingPeer `json:"peers"`
 }
 
 type ExchangeRequest struct {
@@ -149,7 +169,13 @@ func (c *Client) GetPeers() ([]*mesh.Peer, error) {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return result.Peers, nil
+	// Convert SignalingPeer to mesh.Peer
+	peers := make([]*mesh.Peer, len(result.Peers))
+	for i, sp := range result.Peers {
+		peers[i] = sp.ToMeshPeer()
+	}
+
+	return peers, nil
 }
 
 // ExchangeEndpoints exchanges endpoints with a specific peer
@@ -264,6 +290,20 @@ func (c *Client) Unregister() error {
 
 // Start starts the background tasks (heartbeat, peer polling)
 func (c *Client) Start() {
+	// Fetch peers immediately on start
+	go func() {
+		peers, err := c.GetPeers()
+		if err == nil {
+			c.mu.RLock()
+			callback := c.onPeersUpdate
+			c.mu.RUnlock()
+
+			if callback != nil {
+				callback(peers)
+			}
+		}
+	}()
+
 	// Start heartbeat
 	c.wg.Add(1)
 	go c.heartbeatLoop()

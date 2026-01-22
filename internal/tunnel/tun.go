@@ -2,16 +2,23 @@ package tunnel
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"net"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
-
-	"github.com/selftunnel/selftunnel/internal/tunnel/wintun"
-	"github.com/songgao/water"
 )
 
+// TUNInterface is the common interface for TUN device implementations
+type TUNInterface interface {
+	io.ReadWriteCloser
+	Name() string
+}
+
 type TUNDevice struct {
-	iface     *water.Interface
+	iface     TUNInterface
 	name      string
 	mtu       int
 	virtualIP net.IP
@@ -28,31 +35,21 @@ type TUNConfig struct {
 }
 
 func NewTUN(cfg TUNConfig) (*TUNDevice, error) {
-	// On Windows, ensure WinTUN is available
-	if runtime.GOOS == "windows" {
-		if err := wintun.EnsureWinTUN(); err != nil {
-			return nil, fmt.Errorf("failed to initialize WinTUN: %w", err)
-		}
-	}
-
-	config := water.Config{
-		DeviceType: water.TUN,
-	}
-
-	iface, err := water.New(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create TUN interface: %w", err)
-	}
-
+	// Parse IP and CIDR first
 	ip, cidr, err := net.ParseCIDR(cfg.VirtualIP + "/" + cfg.CIDR[len(cfg.CIDR)-2:])
 	if err != nil {
 		// Try parsing CIDR directly
 		ip, cidr, err = net.ParseCIDR(cfg.CIDR)
 		if err != nil {
-			iface.Close()
 			return nil, fmt.Errorf("failed to parse CIDR: %w", err)
 		}
 		ip = net.ParseIP(cfg.VirtualIP)
+	}
+
+	// Create platform-specific TUN interface
+	iface, err := createPlatformTUN(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	tun := &TUNDevice{
@@ -61,10 +58,15 @@ func NewTUN(cfg TUNConfig) (*TUNDevice, error) {
 		mtu:       cfg.MTU,
 		virtualIP: ip,
 		cidr:      cidr,
+		running:   true,
 	}
 
 	return tun, nil
 }
+
+// createPlatformTUN is implemented in platform-specific files:
+// - tun_windows.go for Windows (uses WinTUN)
+// - tun_unix.go for Linux/macOS (uses water/TAP)
 
 // Name returns the interface name
 func (t *TUNDevice) Name() string {
@@ -119,9 +121,40 @@ func (t *TUNDevice) ConfigureInterface() error {
 }
 
 func (t *TUNDevice) configureLinux() error {
-	// On Linux, we need to use ip commands
-	// This would typically be done via netlink, but for simplicity we note it here
-	// In production, use github.com/vishvananda/netlink
+	// On Linux, we need to use ip commands to configure the interface
+	name := t.name
+	ip := t.virtualIP.String()
+	cidrSize, _ := t.cidr.Mask.Size()
+	cidrStr := fmt.Sprintf("%s/%d", ip, cidrSize)
+
+	// Set IP address: ip addr add 10.99.0.2/24 dev tun0
+	cmd := exec.Command("ip", "addr", "add", cidrStr, "dev", name)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Ignore "File exists" error (address already set)
+		if !strings.Contains(string(output), "File exists") {
+			log.Printf("ip addr add output: %s", string(output))
+			return fmt.Errorf("failed to set IP address: %w", err)
+		}
+	}
+
+	// Bring interface up: ip link set tun0 up
+	cmd = exec.Command("ip", "link", "set", name, "up")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("ip link set output: %s", string(output))
+		return fmt.Errorf("failed to bring interface up: %w", err)
+	}
+
+	// Set MTU if specified
+	if t.mtu > 0 {
+		cmd = exec.Command("ip", "link", "set", name, "mtu", fmt.Sprintf("%d", t.mtu))
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("ip link set mtu output: %s", string(output))
+			// MTU setting may fail, but we can continue
+			log.Printf("Warning: failed to set MTU: %v", err)
+		}
+	}
+
+	log.Printf("Configured Linux TUN interface %s with IP %s", name, cidrStr)
 	return nil
 }
 
@@ -131,6 +164,7 @@ func (t *TUNDevice) configureDarwin() error {
 }
 
 func (t *TUNDevice) configureWindows() error {
-	// On Windows, we need to use netsh or WMI
-	return nil
+	// On Windows, we need to use netsh to configure the interface
+	// This is handled in tun_windows.go
+	return configureWindowsInterface(t.name, t.virtualIP.String(), t.cidr, t.mtu)
 }

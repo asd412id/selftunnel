@@ -3,6 +3,7 @@ package nat
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -23,27 +24,34 @@ type PunchResult struct {
 }
 
 func NewHolePuncher(stunServers []string) (*HolePuncher, error) {
-	// Create UDP listener on random port
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	// Create UDP listener on random port - use udp4 for IPv4 only
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDP listener: %w", err)
 	}
 
+	stunClient := NewSTUNClient(stunServers)
+	stunClient.SetConn(conn) // Use shared connection
+
 	return &HolePuncher{
 		localConn:  conn,
-		stunClient: NewSTUNClient(stunServers),
+		stunClient: stunClient,
 	}, nil
 }
 
 func NewHolePuncherWithPort(stunServers []string, port int) (*HolePuncher, error) {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	// Use udp4 for IPv4 only to avoid issues with IPv6 binding on Windows
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDP listener on port %d: %w", port, err)
 	}
 
+	stunClient := NewSTUNClient(stunServers)
+	stunClient.SetConn(conn) // Use shared connection
+
 	return &HolePuncher{
 		localConn:  conn,
-		stunClient: NewSTUNClient(stunServers),
+		stunClient: stunClient,
 	}, nil
 }
 
@@ -147,6 +155,10 @@ func (hp *HolePuncher) attemptPunch(ctx context.Context, peerAddr *net.UDPAddr) 
 }
 
 // SimultaneousPunch performs simultaneous open with a peer
+// Returns the peer's actual address from which we received punch packets
+// NOTE: Since UDP connection is shared with WireGuard, punch packets may be received
+// by WireGuard instead of this receiver. The WireGuard handler should call back
+// to update peer endpoints when it receives punch packets.
 func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []string, duration time.Duration) (*net.UDPAddr, error) {
 	deadline := time.Now().Add(duration)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -156,76 +168,73 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 
 	// Resolve all peer addresses
 	var peerAddrs []*net.UDPAddr
+	seenAddrs := make(map[string]bool)
+
 	for _, endpoint := range peerEndpoints {
 		addr, err := net.ResolveUDPAddr("udp", endpoint)
 		if err == nil {
-			peerAddrs = append(peerAddrs, addr)
+			key := addr.String()
+			if !seenAddrs[key] {
+				seenAddrs[key] = true
+				peerAddrs = append(peerAddrs, addr)
+			}
 		}
 	}
 
-	if len(peerAddrs) == 0 {
-		return nil, fmt.Errorf("no valid peer endpoints")
-	}
-
-	// Start sender goroutine
-	done := make(chan *net.UDPAddr, 1)
-	errCh := make(chan error, 1)
-
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				for _, addr := range peerAddrs {
-					hp.localConn.WriteToUDP(punchPacket, addr)
-				}
-			}
-		}
-	}()
-
-	// Receiver
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			default:
-			}
-
-			hp.localConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, addr, err := hp.localConn.ReadFromUDP(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+	// Add port predictions for symmetric NAT traversal
+	var predictedAddrs []*net.UDPAddr
+	for _, addr := range peerAddrs {
+		if isPublicIPAddr(addr.IP) {
+			for offset := -10; offset <= 10; offset++ {
+				if offset == 0 {
 					continue
 				}
-				continue
-			}
-
-			// Check if it's a punch packet from one of our peers
-			if n >= len(punchPacket) && string(buf[:len(punchPacket)]) == string(punchPacket) {
-				for _, peerAddr := range peerAddrs {
-					if addr.IP.Equal(peerAddr.IP) {
-						done <- addr
-						return
+				predictedPort := addr.Port + offset
+				if predictedPort > 0 && predictedPort < 65536 {
+					predicted := &net.UDPAddr{IP: addr.IP, Port: predictedPort}
+					key := predicted.String()
+					if !seenAddrs[key] {
+						seenAddrs[key] = true
+						predictedAddrs = append(predictedAddrs, predicted)
 					}
 				}
 			}
 		}
-	}()
+	}
 
-	select {
-	case addr := <-done:
-		return addr, nil
-	case err := <-errCh:
-		return nil, err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	allAddrs := append(peerAddrs, predictedAddrs...)
+	log.Printf("[HolePunch] Punching to %d endpoints (%d original + %d predicted)", len(allAddrs), len(peerAddrs), len(predictedAddrs))
+
+	if len(allAddrs) == 0 {
+		return nil, fmt.Errorf("no valid peer endpoints")
+	}
+
+	// Just send punch packets - don't try to receive here since WireGuard will handle incoming
+	// Send for the full duration to give peer time to respond
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+
+	packetsSent := 0
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[HolePunch] Punch complete: sent %d packets to %d endpoints", packetsSent, len(allAddrs))
+			// Return first public endpoint as expected - actual endpoint will be set by WireGuard callback
+			for _, addr := range peerAddrs {
+				if isPublicIPAddr(addr.IP) {
+					return addr, nil
+				}
+			}
+			if len(peerAddrs) > 0 {
+				return peerAddrs[0], nil
+			}
+			return nil, fmt.Errorf("punch timeout")
+		case <-ticker.C:
+			for _, addr := range allAddrs {
+				hp.localConn.WriteToUDP(punchPacket, addr)
+				packetsSent++
+			}
+		}
 	}
 }
 
@@ -260,4 +269,27 @@ func (hp *HolePuncher) GetEndpoints() []string {
 	hp.mu.RUnlock()
 
 	return endpoints
+}
+
+// isPublicIPAddr checks if an IP is a public/routable IP
+func isPublicIPAddr(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+
+	// Private/special ranges
+	if ip4[0] == 10 ||
+		(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) ||
+		(ip4[0] == 192 && ip4[1] == 168) ||
+		(ip4[0] == 169 && ip4[1] == 254) ||
+		ip4[0] == 127 {
+		return false
+	}
+
+	return true
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/selftunnel/selftunnel/internal/dns"
 	"github.com/selftunnel/selftunnel/internal/mesh"
 	"github.com/selftunnel/selftunnel/internal/nat"
+	"github.com/selftunnel/selftunnel/internal/relay"
 	"github.com/selftunnel/selftunnel/internal/signaling"
 	"github.com/selftunnel/selftunnel/internal/tunnel"
 )
@@ -29,6 +32,7 @@ type Daemon struct {
 	signaling   *signaling.Client
 	holePuncher *nat.HolePuncher
 	dnsServer   *dns.Server
+	relayClient *relay.Client
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -147,7 +151,14 @@ func (d *Daemon) Start() error {
 
 	// Set up peer update callback
 	d.signaling.SetPeersUpdateCallback(func(peers []*mesh.Peer) {
+		log.Printf("Received %d peers from signaling server", len(peers))
 		for _, peer := range peers {
+			keyPreview := peer.PublicKey
+			if len(keyPreview) > 16 {
+				keyPreview = keyPreview[:16]
+			}
+			log.Printf("  Peer: %s (%s) - %s...", peer.Name, peer.VirtualIP, keyPreview)
+
 			if peer.PublicKey == d.cfg.PublicKey {
 				continue
 			}
@@ -164,11 +175,15 @@ func (d *Daemon) Start() error {
 					if len(peer.Endpoints) > 0 {
 						endpoint = peer.Endpoints[0]
 					}
-					d.wg.AddPeer(pubKey, endpoint, []string{peer.VirtualIP + "/32"})
+					d.wg.AddPeer(pubKey, endpoint, []string{peer.VirtualIP + "/32"}, peer.PublicKey)
 				}
+			} else {
+				// Update existing peer's endpoints if changed
+				existing.SetEndpoints(peer.Endpoints)
 			}
 		}
-		d.router.UpdateRoutesFromPeers()
+		// NOTE: Don't call router.UpdateRoutesFromPeers() here - it disrupts active connections
+		// WireGuard handles routing via AllowedIPs
 	})
 
 	// Register with signaling server
@@ -185,7 +200,7 @@ func (d *Daemon) Start() error {
 
 	// Create TUN device
 	tunCfg := tunnel.TUNConfig{
-		Name:      "selftun0",
+		Name:      "SelfTunnel",
 		MTU:       d.cfg.MTU,
 		VirtualIP: d.cfg.VirtualIP,
 		CIDR:      d.cfg.VirtualCIDR,
@@ -199,11 +214,19 @@ func (d *Daemon) Start() error {
 		d.tun = tun
 		log.Printf("Created TUN interface: %s", tun.Name())
 
-		// Create WireGuard tunnel
+		// Configure the interface (set IP, bring up, add routes)
+		if err := tun.ConfigureInterface(); err != nil {
+			log.Printf("Warning: Could not configure TUN interface: %v", err)
+		} else {
+			log.Printf("Configured TUN interface with IP %s", d.cfg.VirtualIP)
+		}
+
+		// Create WireGuard tunnel using shared connection from HolePuncher
 		wgCfg := tunnel.WireGuardConfig{
 			TUN:        tun,
 			PrivateKey: privateKey,
 			ListenPort: d.cfg.ListenPort,
+			Conn:       hp.Conn(), // Share UDP connection with HolePuncher
 		}
 
 		wg, err := tunnel.NewWireGuardTunnel(wgCfg)
@@ -211,13 +234,109 @@ func (d *Daemon) Start() error {
 			log.Printf("Warning: Could not create WireGuard tunnel: %v", err)
 		} else {
 			d.wg = wg
+
+			// Track punch count to avoid log spam
+			var punchCount int
+			var lastPunchAddr string
+
+			// Set up punch packet callback - when WG receives punch, update the peer endpoint
+			wg.SetPunchCallback(func(addr *net.UDPAddr) {
+				// Ignore punch from virtual IP range (10.99.0.0/24)
+				ip4 := addr.IP.To4()
+				if ip4 != nil && ip4[0] == 10 && ip4[1] == 99 {
+					return
+				}
+
+				// Ignore punch from our own public IPs
+				myEndpoints := d.holePuncher.GetEndpoints()
+				for _, ep := range myEndpoints {
+					if ep == addr.String() {
+						return
+					}
+				}
+
+				punchCount++
+				addrStr := addr.String()
+
+				// Only log first punch from new address or every 1000 punches
+				if addrStr != lastPunchAddr {
+					log.Printf("[Punch] Receiving punches from %s", addr)
+					lastPunchAddr = addrStr
+				}
+
+				// Find peer and update their endpoint
+				peers := d.peerManager.GetAllPeers()
+				for _, peer := range peers {
+					// Update any peer that isn't connected yet
+					if peer.State != mesh.PeerStateConnected {
+						pubKey := peer.PublicKey
+						peerPubKey, err := crypto.FromBase64(pubKey)
+						if err == nil {
+							d.wg.UpdatePeerEndpoint(peerPubKey, addr.String())
+							// Mark peer as connected
+							if peer.State != mesh.PeerStateConnected {
+								peer.State = mesh.PeerStateConnected
+								log.Printf("[Punch] Peer %s CONNECTED via %s", peer.Name, addr)
+							}
+						}
+						break
+					}
+				}
+			})
+
+			// Set up data received callback - update mesh peer LastSeen
+			wg.SetDataReceivedCallback(func(publicKeyB64 string, isDirect bool) {
+				peer := d.peerManager.GetPeer(publicKeyB64)
+				if peer != nil {
+					wasConnected := peer.GetState() == mesh.PeerStateConnected
+					peer.UpdateLastSeen(true) // Update LastSeen and set connected
+					if !wasConnected {
+						if isDirect {
+							log.Printf("[Data] Peer %s now CONNECTED (direct)", peer.Name)
+						} else {
+							log.Printf("[Data] Peer %s now CONNECTED (relay)", peer.Name)
+						}
+					}
+				}
+			})
+
+			// Set up reconnect callback - triggered when direct connection is stale
+			wg.SetNeedReconnectCallback(func(publicKeyB64 string) {
+				peer := d.peerManager.GetPeer(publicKeyB64)
+				if peer != nil {
+					log.Printf("[Reconnect] Attempting to re-establish direct connection to %s", peer.Name)
+					// Mark peer for reconnection and trigger discovery
+					peer.SetState(mesh.PeerStateConnecting)
+					go d.discovery.ConnectToPeer(publicKeyB64)
+				}
+			})
+
 			if err := wg.Start(); err != nil {
 				log.Printf("Warning: Could not start WireGuard tunnel: %v", err)
 			} else {
 				log.Println("WireGuard tunnel started")
+
+				// Connect to relay server asynchronously
+				go d.connectRelay()
 			}
 		}
 	}
+
+	// Set up peer connect callback to update WireGuard endpoint
+	d.discovery.SetPeerConnectCallback(func(publicKey string, endpoint string) {
+		if d.wg != nil {
+			pubKey, err := crypto.FromBase64(publicKey)
+			if err != nil {
+				log.Printf("Failed to decode public key: %v", err)
+				return
+			}
+			if err := d.wg.UpdatePeerEndpoint(pubKey, endpoint); err != nil {
+				log.Printf("Failed to update peer endpoint: %v", err)
+			} else {
+				log.Printf("[P2P] Updated peer endpoint to %s (direct connection)", endpoint)
+			}
+		}
+	})
 
 	// Start background services
 	d.signaling.Start()
@@ -240,6 +359,76 @@ func (d *Daemon) Start() error {
 	return nil
 }
 
+// connectRelay connects to the relay server asynchronously
+func (d *Daemon) connectRelay() {
+	relayURL := strings.TrimSuffix(d.cfg.SignalingURL, "/register")
+	relayURL = strings.TrimSuffix(relayURL, "/") + "/relay"
+	log.Printf("Relay URL: %s", relayURL)
+
+	d.relayClient = relay.NewClient(relayURL, d.cfg.NetworkID, d.cfg.NetworkSecret, d.cfg.PublicKey)
+
+	// Set up relay data handler to forward to WireGuard
+	d.relayClient.SetDataHandler(func(from string, data []byte) {
+		if d.wg != nil {
+			d.wg.WriteFromRelay(from, data)
+		}
+	})
+
+	// Set up punch coordination handler
+	d.relayClient.SetPunchHandler(func(from string, peerEndpoints []string) {
+		// Get the peer and check state first
+		peer := d.peerManager.GetPeer(from)
+		if peer == nil {
+			log.Printf("[Punch] Unknown peer %s, ignoring punch request", from[:16])
+			return
+		}
+
+		// IMPORTANT: Don't disturb a working direct connection!
+		// Only process punch request if peer is not connected or hasn't been seen recently
+		currentState := peer.GetState()
+		lastSeen := peer.GetLastSeen()
+
+		if currentState == mesh.PeerStateConnected && time.Since(lastSeen) < 30*time.Second {
+			log.Printf("[Punch] Ignoring punch request from %s - already connected (last seen %v ago)", peer.Name, time.Since(lastSeen))
+			return
+		}
+
+		log.Printf("[Punch] Received coordinated punch request from %s with %d endpoints", peer.Name, len(peerEndpoints))
+
+		// Merge endpoints: use fresh ones from punch request + existing ones
+		existingEndpoints := peer.GetEndpoints()
+		mergedEndpoints := peerEndpoints
+		for _, ep := range existingEndpoints {
+			found := false
+			for _, pep := range peerEndpoints {
+				if ep == pep {
+					found = true
+					break
+				}
+			}
+			if !found {
+				mergedEndpoints = append(mergedEndpoints, ep)
+			}
+		}
+		peer.SetEndpoints(mergedEndpoints)
+		log.Printf("[Punch] Merged %d endpoints for peer %s", len(mergedEndpoints), peer.Name)
+
+		// Mark peer as connecting so we accept incoming punch
+		peer.SetState(mesh.PeerStateConnecting)
+
+		// Start hole punching in background
+		go d.discovery.ConnectToPeer(from)
+	})
+
+	if err := d.relayClient.Connect(); err != nil {
+		log.Printf("Warning: Could not connect to relay: %v", err)
+	} else {
+		log.Println("Connected to relay server (fallback enabled)")
+		d.wg.SetRelay(d.relayClient)
+		d.discovery.SetRelayClient(d.relayClient) // Enable coordinated hole punching
+	}
+}
+
 func (d *Daemon) Stop() {
 	log.Println("Stopping SelfTunnel daemon...")
 	d.cancel()
@@ -254,6 +443,10 @@ func (d *Daemon) Stop() {
 
 	if d.signaling != nil {
 		d.signaling.Stop()
+	}
+
+	if d.relayClient != nil {
+		d.relayClient.Close()
 	}
 
 	if d.wg != nil {
@@ -280,6 +473,12 @@ func (d *Daemon) Status() {
 	if d.tun != nil {
 		log.Printf("  TUN Interface: %s", d.tun.Name())
 	}
+
+	relayStatus := "disconnected"
+	if d.relayClient != nil && d.relayClient.IsConnected() {
+		relayStatus = "connected"
+	}
+	log.Printf("  Relay: %s", relayStatus)
 
 	if d.dnsServer != nil {
 		log.Printf("  DNS: %s.%s -> %s (port %d)", d.cfg.NodeName, d.cfg.DNSSuffix, d.cfg.VirtualIP, d.cfg.DNSPort)
