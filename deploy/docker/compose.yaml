@@ -23,7 +23,7 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: selftunnel-cloudflared
     restart: unless-stopped
-    command: tunnel run
+    command: tunnel --protocol http2 run
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     depends_on:
