@@ -422,11 +422,19 @@ func (s *Server) handleRelay(w http.ResponseWriter, r *http.Request) {
 			s.connMu.RUnlock()
 
 			if targetConn != nil {
-				targetConn.WriteJSON(RelayMessage{
+				err := targetConn.WriteJSON(RelayMessage{
 					Type:    "data",
 					From:    publicKey,
 					Payload: relayMsg.Payload,
 				})
+				if err != nil {
+					log.Printf("[%s] Relay data forward failed: %s -> %s: %v",
+						truncate(currentNetworkID, 8), truncate(publicKey, 16), truncate(relayMsg.To, 16), err)
+				}
+			} else {
+				// Target not connected - log for debugging
+				log.Printf("[%s] Relay data dropped: %s -> %s (target not connected)",
+					truncate(currentNetworkID, 8), truncate(publicKey, 16), truncate(relayMsg.To, 16))
 			}
 
 		case "punch":

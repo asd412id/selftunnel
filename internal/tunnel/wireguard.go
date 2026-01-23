@@ -608,6 +608,19 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 		}
 	}
 
+	// Debug: Log why relay wasn't used (helps diagnose asymmetric NAT issues)
+	if !relaySent && !directWorking {
+		relayConnected := relay != nil && relay.IsConnected()
+		log.Printf("[WG-Debug] Packet to %s: direct=%v relay=%v (relayConn=%v, peerKey=%v, shouldRelay=%v, directWorking=%v, lastDirectRx=%v)",
+			dstIP, directSent, relaySent, relayConnected, peerKey != "", shouldUseRelay, directWorking,
+			func() string {
+				if lastDirectReceive.IsZero() {
+					return "never"
+				}
+				return time.Since(lastDirectReceive).String()
+			}())
+	}
+
 	// Debug logging only for VPN traffic
 	// Use peer.GetState() for thread-safe access (bug fix: race_condition.3)
 	peer.mu.RLock()

@@ -412,6 +412,8 @@ func (c *Client) reader() {
 				data, err := base64.StdEncoding.DecodeString(relayMsg.Payload)
 				if err == nil {
 					c.onData(relayMsg.From, data)
+				} else {
+					log.Printf("[Relay] Failed to decode payload from %s: %v", relayMsg.From[:16], err)
 				}
 			}
 		case MsgTypePunch:
