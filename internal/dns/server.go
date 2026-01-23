@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -225,18 +226,21 @@ func (s *Server) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 func (s *Server) forwardToUpstream(query []byte) ([]byte, error) {
 	conn, err := net.Dial("udp", s.upstream)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to dial upstream DNS: %w", err)
 	}
 	defer conn.Close()
 
+	// Set deadline to prevent blocking forever (bug fix: resource_leak.2)
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
 	if _, err := conn.Write(query); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to write to upstream DNS: %w", err)
 	}
 
 	response := make([]byte, 512)
 	n, err := conn.Read(response)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read from upstream DNS: %w", err)
 	}
 
 	return response[:n], nil

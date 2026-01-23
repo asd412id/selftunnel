@@ -20,6 +20,7 @@ type Client struct {
 	httpClient    *http.Client
 	localPeer     *mesh.Peer
 	onPeersUpdate func([]*mesh.Peer)
+	lastPeerState map[string]string // FIX: bug.multinode.7 - Cache peer state for diff
 	mu            sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -77,6 +78,7 @@ func NewClient(baseURL, networkID, networkSecret string) *Client {
 		baseURL:       baseURL,
 		networkID:     networkID,
 		networkSecret: networkSecret,
+		lastPeerState: make(map[string]string), // FIX: bug.multinode.7
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -342,6 +344,7 @@ func (c *Client) heartbeatLoop() {
 	}
 }
 
+// FIX: bug.multinode.7 - Only trigger callback for changed peers
 func (c *Client) peerPollingLoop() {
 	defer c.wg.Done()
 
@@ -358,15 +361,51 @@ func (c *Client) peerPollingLoop() {
 				continue
 			}
 
+			// FIX: Filter to only changed or new peers
+			changedPeers := c.filterChangedPeers(peers)
+
+			if len(changedPeers) == 0 {
+				continue // No changes, skip callback
+			}
+
 			c.mu.RLock()
 			callback := c.onPeersUpdate
 			c.mu.RUnlock()
 
 			if callback != nil {
-				callback(peers)
+				callback(changedPeers)
 			}
 		}
 	}
+}
+
+// filterChangedPeers returns only peers that are new or have changed endpoints
+func (c *Client) filterChangedPeers(peers []*mesh.Peer) []*mesh.Peer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var changed []*mesh.Peer
+	newState := make(map[string]string)
+
+	for _, peer := range peers {
+		// Create state hash from endpoints
+		endpointHash := ""
+		for _, ep := range peer.Endpoints {
+			endpointHash += ep + ","
+		}
+		newState[peer.PublicKey] = endpointHash
+
+		// Check if peer is new or endpoints changed
+		oldHash, exists := c.lastPeerState[peer.PublicKey]
+		if !exists || oldHash != endpointHash {
+			changed = append(changed, peer)
+		}
+	}
+
+	// Update cached state
+	c.lastPeerState = newState
+
+	return changed
 }
 
 // Stop stops the client and background tasks

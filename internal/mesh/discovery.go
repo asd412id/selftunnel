@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -67,11 +68,13 @@ func (d *Discovery) Start() error {
 		mapped = nil
 	}
 
-	// Update local peer's endpoints
+	// Update local peer's endpoints (with nil check for safety - bug fix: nil_pointer.2)
 	localPeer := d.peerManager.LocalPeer()
-	localPeer.mu.Lock()
-	localPeer.Endpoints = d.holePuncher.GetEndpoints()
-	localPeer.mu.Unlock()
+	if localPeer != nil {
+		localPeer.mu.Lock()
+		localPeer.Endpoints = d.holePuncher.GetEndpoints()
+		localPeer.mu.Unlock()
+	}
 
 	// Start periodic discovery
 	d.wg.Add(1)
@@ -107,11 +110,13 @@ func (d *Discovery) refreshPublicAddress() {
 		return
 	}
 
-	// Update local peer's endpoints
+	// Update local peer's endpoints (with nil check for safety - bug fix: nil_pointer.2)
 	localPeer := d.peerManager.LocalPeer()
-	localPeer.mu.Lock()
-	localPeer.Endpoints = d.holePuncher.GetEndpoints()
-	localPeer.mu.Unlock()
+	if localPeer != nil {
+		localPeer.mu.Lock()
+		localPeer.Endpoints = d.holePuncher.GetEndpoints()
+		localPeer.mu.Unlock()
+	}
 
 	d.mu.RLock()
 	callback := d.onDiscovered
@@ -125,10 +130,11 @@ func (d *Discovery) refreshPublicAddress() {
 func (d *Discovery) maintenanceLoop() {
 	defer d.wg.Done()
 
+	// FIX: bug.multinode.12 - Stagger intervals to avoid synchronized load
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	retryTicker := time.NewTicker(10 * time.Second) // Retry direct connection every 10s
+	retryTicker := time.NewTicker(15 * time.Second) // Changed from 10s to 15s
 	defer retryTicker.Stop()
 
 	for {
@@ -143,9 +149,12 @@ func (d *Discovery) maintenanceLoop() {
 	}
 }
 
+// FIX: bug.multinode.1 - Use bounded concurrency instead of spawning unlimited goroutines
 func (d *Discovery) maintainConnections() {
 	peers := d.peerManager.GetAllPeers()
 
+	// Collect peers that need connection
+	var peersToConnect []*Peer
 	for _, peer := range peers {
 		peer.mu.RLock()
 		state := peer.State
@@ -153,9 +162,52 @@ func (d *Discovery) maintainConnections() {
 		peer.mu.RUnlock()
 
 		if state == PeerStateDisconnected && len(endpoints) > 0 {
-			// Try to establish connection
-			go d.attemptConnection(peer)
+			peersToConnect = append(peersToConnect, peer)
 		}
+	}
+
+	if len(peersToConnect) == 0 {
+		return
+	}
+
+	// FIX: Limit concurrent connection attempts to prevent thundering herd
+	maxConcurrent := 3
+	if len(peersToConnect) < maxConcurrent {
+		maxConcurrent = len(peersToConnect)
+	}
+
+	// Use semaphore pattern for bounded concurrency
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
+	for i, peer := range peersToConnect {
+		// FIX: Add jitter between connection attempts
+		if i > 0 {
+			jitter := time.Duration(100+rand.Intn(200)) * time.Millisecond
+			time.Sleep(jitter)
+		}
+
+		wg.Add(1)
+		go func(p *Peer) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire
+			defer func() { <-sem }() // Release
+			d.attemptConnection(p)
+		}(peer)
+	}
+
+	// Wait with timeout to prevent blocking forever
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		log.Printf("[Discovery] maintainConnections timeout, some peers may not be processed")
+	case <-d.ctx.Done():
 	}
 }
 
@@ -236,10 +288,11 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 		return
 	}
 
-	// Check cooldown - don't punch same peer more than once per 30 seconds
+	// FIX: bug.multinode.2 - Reduced cooldown from 30s to 10s for multi-node
+	// Check cooldown - don't punch same peer more than once per 10 seconds
 	d.mu.Lock()
 	lastPunch, exists := d.punchCooldown[publicKey]
-	if exists && time.Since(lastPunch) < 30*time.Second {
+	if exists && time.Since(lastPunch) < 10*time.Second {
 		d.mu.Unlock()
 		return
 	}
@@ -273,12 +326,12 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 
 	log.Printf("[Discovery] Punching to %s (%d public, %d private endpoints)", peerName, len(publicEndpoints), len(privateEndpoints))
 
-	// Send punch packets for 2 seconds (reduced from 5s for faster connection)
-	// Actual endpoint will be set by WireGuard when it receives punch response
-	ctx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
-	defer cancel()
+	// Send punch packets for 5 seconds (increased from 2s for multi-node congestion)
+	// FIX: bug.multinode.9 - Adaptive timeout for multi-peer scenarios
+	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+	defer cancel() // Ensure context resources are cleaned up
 
-	_, _ = d.holePuncher.SimultaneousPunch(ctx, allEndpoints, 2*time.Second)
+	_, _ = d.holePuncher.SimultaneousPunch(ctx, allEndpoints, 5*time.Second)
 
 	// Check if peer got connected via WireGuard callback
 	peer.mu.Lock()

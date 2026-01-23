@@ -51,7 +51,6 @@ type Client struct {
 	writeMu   sync.Mutex // Mutex for websocket writes - gorilla/websocket only supports one concurrent writer
 
 	sendCh chan []byte
-	recvCh chan *RelayMessage
 
 	onData       func(from string, data []byte)
 	onPunch      func(from string, endpoints []string) // callback when peer wants to punch
@@ -73,7 +72,6 @@ func NewClient(relayURL, networkID, networkSecret, publicKey string) *Client {
 		networkSecret: networkSecret,
 		publicKey:     publicKey,
 		sendCh:        make(chan []byte, 1000), // Increased buffer for bursty traffic like SSH
-		recvCh:        make(chan *RelayMessage, 1000),
 	}
 }
 
@@ -361,7 +359,7 @@ func (c *Client) reader() {
 			return
 		}
 
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second)) // Increased timeout for 2x keepalive buffer (bug fix: blocking.2)
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -483,23 +481,27 @@ func (c *Client) autoReconnectLoop() {
 	attempt := 0
 
 	for {
-		select {
-		case <-c.ctx.done:
+		// Check if auto-reconnect was disabled
+		if !c.autoReconnect {
+			log.Printf("[Relay] Auto-reconnect disabled, stopping reconnect loop")
 			return
-		default:
 		}
 
 		attempt++
 		log.Printf("[Relay] Attempting reconnect (attempt %d)...", attempt)
 
-		// Reset context for new connection
-		c.ctx.done = make(chan struct{})
-
 		if err := c.Connect(); err != nil {
 			log.Printf("[Relay] Reconnect failed: %v", err)
 
-			// Exponential backoff
-			time.Sleep(backoff)
+			// Exponential backoff with interruptible sleep
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-c.ctx.done:
+				timer.Stop()
+				return
+			}
+
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff

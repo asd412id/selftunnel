@@ -172,21 +172,33 @@ func (hp *HolePuncher) attemptPunch(ctx context.Context, peerAddr *net.UDPAddr) 
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Wait for response
-	hp.localConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// Wait for response - DON'T modify deadline on shared connection (bug fix: blocking.1)
+	// Instead use a separate timeout via context
+	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer readCancel()
+
 	buf := make([]byte, 1500)
+	maxIterations := 100 // Prevent infinite loop (bug fix: infinite_loop.1)
+	iterations := 0
 
 	for {
 		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
+		case <-readCtx.Done():
+			return false, nil // Timeout - not an error, just no response
 		default:
 		}
 
+		iterations++
+		if iterations > maxIterations {
+			return false, nil // Max iterations reached
+		}
+
+		// Use short read deadline per iteration instead of modifying shared connection
+		hp.localConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 		n, addr, err := hp.localConn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				return false, nil
+				continue // Timeout on this read, try again
 			}
 			return false, err
 		}
@@ -202,6 +214,7 @@ func (hp *HolePuncher) attemptPunch(ctx context.Context, peerAddr *net.UDPAddr) 
 
 // SimultaneousPunch performs simultaneous open with a peer
 // Uses birthday attack for symmetric NAT traversal
+// FIX: bug.multinode.3 - Added rate limiting to prevent UDP socket saturation
 func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []string, duration time.Duration) (*net.UDPAddr, error) {
 	deadline := time.Now().Add(duration)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -241,7 +254,12 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 		if natType == NATTypeSymmetric {
 			// For symmetric NAT: use birthday attack with wider range
 			// Also use port delta if detected
-			predictedAddrs = append(predictedAddrs, generateSymmetricNATPorts(addr, portDelta, seenAddrs)...)
+			// FIX: Limit predicted addresses to avoid flooding
+			predicted := generateSymmetricNATPorts(addr, portDelta, seenAddrs)
+			if len(predicted) > 50 {
+				predicted = predicted[:50] // Cap at 50 predicted ports per address
+			}
+			predictedAddrs = append(predictedAddrs, predicted...)
 		} else {
 			// For cone NAT: use smaller range around known port
 			for offset := -10; offset <= 10; offset++ {
@@ -262,6 +280,22 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 	}
 
 	allAddrs := append(peerAddrs, predictedAddrs...)
+
+	// FIX: Cap total endpoints to prevent excessive packet sending
+	maxEndpoints := 100
+	if len(allAddrs) > maxEndpoints {
+		// Prioritize: original endpoints first, then predicted
+		if len(peerAddrs) >= maxEndpoints {
+			allAddrs = peerAddrs[:maxEndpoints]
+		} else {
+			remaining := maxEndpoints - len(peerAddrs)
+			if remaining > len(predictedAddrs) {
+				remaining = len(predictedAddrs)
+			}
+			allAddrs = append(peerAddrs, predictedAddrs[:remaining]...)
+		}
+	}
+
 	log.Printf("[HolePunch] Punching to %d endpoints (%d original + %d predicted, NAT: %s)",
 		len(allAddrs), len(peerAddrs), len(predictedAddrs), natType)
 
@@ -269,15 +303,15 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 		return nil, fmt.Errorf("no valid peer endpoints")
 	}
 
-	// Send punch packets - reduced rate to avoid flooding
-	// Previous: 10ms ticker × 50 batch = 10000 packets/2s (too aggressive!)
-	// New: 50ms ticker × 10 batch = ~400 packets/2s (sufficient for NAT traversal)
-	ticker := time.NewTicker(50 * time.Millisecond)
+	// FIX: More conservative rate limiting for multi-node scenarios
+	// Previous: 50ms × 10 batch = 200 packets/s (still too aggressive for 3+ nodes)
+	// New: 100ms × 5 batch = 50 packets/s (sustainable for multi-peer)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	packetsSent := 0
-	batchSize := 10   // Reduced batch size
-	maxPackets := 500 // Cap total packets per punch attempt
+	batchSize := 5    // Reduced batch size for multi-node
+	maxPackets := 100 // Reduced from 500 to 100 for multi-node scenarios
 
 	for {
 		select {
@@ -298,10 +332,14 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 			if packetsSent >= maxPackets {
 				continue
 			}
-			// Send to a batch of addresses
+			// FIX: Round-robin through addresses instead of sequential burst
 			for i := 0; i < batchSize && i < len(allAddrs); i++ {
 				idx := (packetsSent + i) % len(allAddrs)
-				hp.localConn.WriteToUDP(punchPacket, allAddrs[idx])
+				_, err := hp.localConn.WriteToUDP(punchPacket, allAddrs[idx])
+				if err != nil {
+					// FIX: Backpressure - if write fails, pause briefly
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
 			packetsSent += batchSize
 		}

@@ -1,6 +1,7 @@
 package nat
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -298,9 +299,13 @@ func buildBindingRequest() []byte {
 	// Magic Cookie
 	binary.BigEndian.PutUint32(request[4:8], stunMagicCookie)
 
-	// Transaction ID (12 bytes random)
-	for i := 8; i < 20; i++ {
-		request[i] = byte(time.Now().UnixNano() >> (i * 8))
+	// Transaction ID (12 bytes) - use crypto/rand for secure random IDs (bug fix: error_handling.3)
+	// Fallback to time-based if crypto/rand fails
+	if _, err := rand.Read(request[8:20]); err != nil {
+		// Fallback to time-based (less secure but functional)
+		for i := 8; i < 20; i++ {
+			request[i] = byte(time.Now().UnixNano() >> (i * 8))
+		}
 	}
 
 	return request

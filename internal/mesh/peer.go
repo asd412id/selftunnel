@@ -189,8 +189,10 @@ func (pm *PeerManager) GetConnectedPeers() []*Peer {
 	return peers
 }
 
-// LocalPeer returns the local peer
+// LocalPeer returns the local peer (may be nil if not set)
 func (pm *PeerManager) LocalPeer() *Peer {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	return pm.localPeer
 }
 

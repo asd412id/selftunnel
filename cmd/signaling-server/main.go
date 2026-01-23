@@ -74,7 +74,28 @@ func NewServer() *Server {
 		networks:    make(map[string]*Network),
 		connections: make(map[string]map[string]*websocket.Conn),
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				// Allow connections without Origin header (non-browser clients like CLI tools)
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true
+				}
+				// Allow localhost for development
+				if strings.HasPrefix(origin, "http://localhost") ||
+					strings.HasPrefix(origin, "https://localhost") ||
+					strings.HasPrefix(origin, "http://127.0.0.1") ||
+					strings.HasPrefix(origin, "https://127.0.0.1") {
+					return true
+				}
+				// Allow same-origin requests
+				host := r.Host
+				if strings.Contains(origin, host) {
+					return true
+				}
+				// Reject cross-origin browser requests to prevent CSRF
+				log.Printf("[Security] Rejected WebSocket connection from origin: %s (host: %s)", origin, host)
+				return false
+			},
 		},
 		peerTTL: 5 * time.Minute,
 	}
@@ -171,7 +192,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Check if name is already in use by another peer
 	for pk, existingPeer := range network.Peers {
 		if pk != req.Peer.PublicKey && strings.EqualFold(existingPeer.Name, req.Peer.Name) {
-			network.mu.Unlock()
+			// Note: defer handles unlock, so just return after writing response
 			writeJSON(w, http.StatusConflict, map[string]string{
 				"error": fmt.Sprintf("Node name '%s' is already in use by another peer. Please use a unique name.", req.Peer.Name),
 			})

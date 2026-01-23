@@ -1,10 +1,14 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -108,4 +112,60 @@ func GenerateNetworkID() (string, error) {
 		return "", fmt.Errorf("failed to generate network ID: %w", err)
 	}
 	return base64.URLEncoding.EncodeToString(id)[:22], nil
+}
+
+// Encryptor handles authenticated encryption using ChaCha20-Poly1305
+type Encryptor struct {
+	aead  cipher.AEAD
+	nonce uint64 // atomic counter for nonce
+}
+
+// NewEncryptor creates a new encryptor from a shared secret
+func NewEncryptor(sharedSecret [KeySize]byte) (*Encryptor, error) {
+	aead, err := chacha20poly1305.New(sharedSecret[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+	return &Encryptor{aead: aead}, nil
+}
+
+// Encrypt encrypts plaintext with authentication
+// Returns: nonce (8 bytes) + ciphertext + tag (16 bytes)
+func (e *Encryptor) Encrypt(plaintext []byte) []byte {
+	// Use atomic counter for nonce to ensure uniqueness
+	nonceVal := atomic.AddUint64(&e.nonce, 1)
+
+	// Build 12-byte nonce: 4 zero bytes + 8-byte counter
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	binary.LittleEndian.PutUint64(nonce[4:], nonceVal)
+
+	// Encrypt and authenticate
+	// Output: 8-byte nonce counter + ciphertext + 16-byte tag
+	result := make([]byte, 8, 8+len(plaintext)+chacha20poly1305.Overhead)
+	binary.LittleEndian.PutUint64(result, nonceVal)
+
+	return e.aead.Seal(result, nonce, plaintext, nil)
+}
+
+// Decrypt decrypts and authenticates ciphertext
+// Input: nonce (8 bytes) + ciphertext + tag (16 bytes)
+func (e *Encryptor) Decrypt(data []byte) ([]byte, error) {
+	if len(data) < 8+chacha20poly1305.Overhead {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	// Extract nonce counter from data
+	nonceVal := binary.LittleEndian.Uint64(data[:8])
+
+	// Build 12-byte nonce
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	binary.LittleEndian.PutUint64(nonce[4:], nonceVal)
+
+	// Decrypt and verify
+	plaintext, err := e.aead.Open(nil, nonce, data[8:], nil)
+	if err != nil {
+		return nil, fmt.Errorf("decryption failed: %w", err)
+	}
+
+	return plaintext, nil
 }

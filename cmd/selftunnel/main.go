@@ -312,10 +312,16 @@ func peersCmd() *cobra.Command {
 					}
 				}
 
+				// Safe slice of public key (bug fix: nil_pointer.1)
+				publicKeyDisplay := peer.PublicKey
+				if len(publicKeyDisplay) > 44 {
+					publicKeyDisplay = publicKeyDisplay[:44]
+				}
+
 				fmt.Printf("%-20s %-15s %-44s %s%s\n",
 					peer.Name,
 					peer.VirtualIP,
-					peer.PublicKey[:44],
+					publicKeyDisplay,
 					endpoints,
 					isSelf,
 				)

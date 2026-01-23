@@ -164,7 +164,9 @@ func (d *Daemon) Start() error {
 
 	if d.cfg.VirtualIP == "" {
 		d.cfg.VirtualIP = resp.VirtualIP
-		d.cfg.Save()
+		if err := d.cfg.Save(); err != nil {
+			log.Printf("Warning: failed to save config: %v", err)
+		}
 	}
 
 	// Decide which WireGuard implementation to use
@@ -475,8 +477,13 @@ func (d *Daemon) Stop() {
 
 // handlePeersUpdate processes peer updates from signaling server
 // This runs in a separate goroutine to avoid blocking the signaling loop
+// FIX: bug.multinode.8 - Added staggering to prevent thundering herd
 func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 	log.Printf("Received %d peers from signaling server", len(peers))
+
+	// FIX: Collect new peers and connect with staggered delay
+	var newPeers []*mesh.Peer
+
 	for _, peer := range peers {
 		keyPreview := peer.PublicKey
 		if len(keyPreview) > 16 {
@@ -513,10 +520,8 @@ func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 				}
 			}
 
-			// Immediately attempt direct connection to new peer
-			if d.discovery != nil {
-				go d.discovery.ConnectToPeer(peer.PublicKey)
-			}
+			// FIX: Collect new peers instead of immediate connection
+			newPeers = append(newPeers, peer)
 		} else {
 			// Update existing peer's endpoints if changed
 			endpointChanged := existing.SetEndpoints(peer.Endpoints)
@@ -539,7 +544,7 @@ func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 						d.wg.UpdatePeerEndpointByKey(existing.PublicKey, peer.Endpoints[0])
 					}
 
-					// Attempt new direct connection
+					// Attempt new direct connection (don't add to stagger queue - this is a reconnect)
 					if d.discovery != nil {
 						go d.discovery.ConnectToPeer(peer.PublicKey)
 					}
@@ -552,6 +557,19 @@ func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 				}
 			}
 		}
+	}
+
+	// FIX: bug.multinode.8 - Staggered connection for new peers
+	if len(newPeers) > 0 && d.discovery != nil {
+		go func() {
+			for i, peer := range newPeers {
+				// First peer immediate, subsequent peers with 1s delay
+				if i > 0 {
+					time.Sleep(1 * time.Second)
+				}
+				d.discovery.ConnectToPeer(peer.PublicKey)
+			}
+		}()
 	}
 }
 
@@ -583,9 +601,11 @@ func (d *Daemon) Status() {
 	log.Printf("  Peers: %d", len(peers))
 	for _, p := range peers {
 		state := "disconnected"
-		if p.State == mesh.PeerStateConnected {
+		// Use GetState() for thread-safe access (bug fix: race_condition.4)
+		peerState := p.GetState()
+		if peerState == mesh.PeerStateConnected {
 			state = "connected"
-		} else if p.State == mesh.PeerStateConnecting {
+		} else if peerState == mesh.PeerStateConnecting {
 			state = "connecting"
 		}
 		log.Printf("    - %s (%s): %s", p.Name, p.VirtualIP, state)

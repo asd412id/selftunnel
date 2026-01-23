@@ -162,7 +162,7 @@ func setupNetworkConfig(instanceName, networkID, networkSecret, nodeName, signal
 	// Register with signaling server
 	resp, err := client.Register()
 	if err != nil {
-		return fmt.Errorf("failed to register with network: %w\n\nPlease check:\n  1. Network ID and Secret are correct\n  2. Signaling server is accessible: %s\n  3. No firewall/proxy blocking the connection", cfg.SignalingURL)
+		return fmt.Errorf("failed to register with network: %w\n\nPlease check:\n  1. Network ID and Secret are correct\n  2. Signaling server is accessible: %s\n  3. No firewall/proxy blocking the connection", err, cfg.SignalingURL)
 	}
 
 	cfg.VirtualIP = resp.VirtualIP
