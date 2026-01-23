@@ -115,6 +115,7 @@ func (s *Server) Stop() {
 
 func (s *Server) serve() {
 	buf := make([]byte, 512)
+	log.Printf("[DNS] Server listening, waiting for queries...")
 	for {
 		select {
 		case <-s.stopCh:
@@ -130,9 +131,11 @@ func (s *Server) serve() {
 			if !running {
 				return
 			}
+			log.Printf("[DNS] ReadFromUDP error: %v", err)
 			continue
 		}
 
+		log.Printf("[DNS] Received %d bytes from %s", n, remoteAddr)
 		go s.handleQuery(buf[:n], remoteAddr)
 	}
 }
@@ -145,8 +148,11 @@ func (s *Server) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 	// Parse DNS query
 	query, err := parseDNSQuery(data)
 	if err != nil {
+		log.Printf("[DNS] Failed to parse query from %s: %v", remoteAddr, err)
 		return
 	}
+
+	log.Printf("[DNS] Received query from %s: %s (type=%d)", remoteAddr, query.Name, query.QType)
 
 	// Check if it's a query for our suffix
 	name := strings.ToLower(query.Name)
@@ -157,22 +163,49 @@ func (s *Server) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 		peerName := strings.TrimSuffix(name, suffix)
 		peerName = strings.TrimSuffix(peerName, ".") // Remove trailing dot if any
 
+		log.Printf("[DNS] Looking up peer: '%s'", peerName)
+
 		// Check if it's the local node
 		localName, localIP := s.resolver.GetLocalPeer()
 		if strings.EqualFold(peerName, localName) {
+			log.Printf("[DNS] Query for local peer %s -> %s", peerName, localIP)
 			response := buildDNSResponse(query, localIP)
 			s.conn.WriteToUDP(response, remoteAddr)
 			return
 		}
 
-		// Look up peer
+		// Look up peer - try original name first
 		if ip, found := s.resolver.GetPeerByName(peerName); found {
+			log.Printf("[DNS] Query for peer %s -> %s", peerName, ip)
 			response := buildDNSResponse(query, ip)
 			s.conn.WriteToUDP(response, remoteAddr)
 			return
 		}
 
+		// Try with underscores replaced by dashes (DNS doesn't like underscores)
+		altName := strings.ReplaceAll(peerName, "-", "_")
+		if altName != peerName {
+			if ip, found := s.resolver.GetPeerByName(altName); found {
+				log.Printf("[DNS] Query for peer %s (alt: %s) -> %s", peerName, altName, ip)
+				response := buildDNSResponse(query, ip)
+				s.conn.WriteToUDP(response, remoteAddr)
+				return
+			}
+		}
+
+		// Try with dashes replaced by underscores
+		altName2 := strings.ReplaceAll(peerName, "_", "-")
+		if altName2 != peerName {
+			if ip, found := s.resolver.GetPeerByName(altName2); found {
+				log.Printf("[DNS] Query for peer %s (alt: %s) -> %s", peerName, altName2, ip)
+				response := buildDNSResponse(query, ip)
+				s.conn.WriteToUDP(response, remoteAddr)
+				return
+			}
+		}
+
 		// Peer not found - return NXDOMAIN
+		log.Printf("[DNS] Query for unknown peer %s -> NXDOMAIN", peerName)
 		response := buildNXDomainResponse(query)
 		s.conn.WriteToUDP(response, remoteAddr)
 		return

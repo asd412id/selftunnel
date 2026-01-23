@@ -48,6 +48,7 @@ type Client struct {
 	conn      *websocket.Conn
 	connected bool
 	connMu    sync.RWMutex
+	writeMu   sync.Mutex // Mutex for websocket writes - gorilla/websocket only supports one concurrent writer
 
 	sendCh chan []byte
 	recvCh chan *RelayMessage
@@ -336,6 +337,9 @@ func (c *Client) sendMessage(msg *RelayMessage) error {
 		return fmt.Errorf("not connected")
 	}
 
+	// Use writeMu to prevent concurrent writes - gorilla/websocket only supports one writer at a time
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return conn.WriteMessage(websocket.TextMessage, msgBytes)
 }
 
@@ -425,8 +429,13 @@ func (c *Client) writer() {
 				return
 			}
 
+			// Use writeMu to prevent concurrent writes - gorilla/websocket only supports one writer at a time
+			c.writeMu.Lock()
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			err := conn.WriteMessage(websocket.TextMessage, msg)
+			c.writeMu.Unlock()
+
+			if err != nil {
 				log.Printf("Relay write error: %v", err)
 				return
 			}

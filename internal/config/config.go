@@ -11,7 +11,7 @@ const (
 	DefaultMTU          = 1420
 	DefaultKeepalive    = 25
 	DefaultVirtualCIDR  = "10.99.0.0/24"
-	DefaultSignalingURL = "https://selftunnel.maccaqe.id"
+	DefaultSignalingURL = "https://selftunnel-signaling.maccaqe.workers.dev" // Cloudflare Worker
 	DefaultDNSPort      = 53
 	DefaultDNSSuffix    = "selftunnel"
 )

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/selftunnel/selftunnel/internal/tunnel/wintun"
 	wintunlib "golang.zx2c4.com/wintun"
@@ -83,7 +84,7 @@ func (w *WindowsTUN) Write(buf []byte) (int, error) {
 }
 
 func (w *WindowsTUN) Close() error {
-	// Cleanup DNS NRPT rules
+	// Cleanup DNS NRPT rules and hosts file entries
 	cleanupWindowsDNS()
 
 	w.session.End()
@@ -149,7 +150,12 @@ func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error 
 
 	// Add NRPT rule for .selftunnel domain using PowerShell
 	// This tells Windows to use our DNS server for *.selftunnel queries
-	psCmd := fmt.Sprintf(`Add-DnsClientNrptRule -Namespace ".selftunnel" -NameServers "%s" -ErrorAction SilentlyContinue`, ip)
+	// First remove any existing rule to avoid duplicates
+	psCleanup := `Get-DnsClientNrptRule | Where-Object {$_.Namespace -eq ".selftunnel"} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue`
+	cmd = exec.Command("powershell", "-Command", psCleanup)
+	cmd.Run() // Ignore errors
+
+	psCmd := fmt.Sprintf(`Add-DnsClientNrptRule -Namespace ".selftunnel" -NameServers "%s" -ErrorAction Stop`, ip)
 	cmd = exec.Command("powershell", "-Command", psCmd)
 	output, err = cmd.CombinedOutput()
 	if err != nil {
@@ -157,6 +163,25 @@ func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error 
 		log.Printf("Warning: failed to add NRPT rule: %v (DNS may not work for .selftunnel)", err)
 	} else {
 		log.Printf("Added NRPT rule for .selftunnel -> %s", ip)
+	}
+
+	// Verify NRPT rule was added
+	psVerify := `Get-DnsClientNrptRule | Where-Object {$_.Namespace -eq ".selftunnel"} | Format-List Namespace,NameServers`
+	cmd = exec.Command("powershell", "-Command", psVerify)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to verify NRPT rule: %v", err)
+	} else {
+		log.Printf("NRPT rule verification:\n%s", string(output))
+	}
+
+	// Flush DNS cache to ensure new rules take effect immediately
+	cmd = exec.Command("ipconfig", "/flushdns")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("ipconfig /flushdns output: %s", string(output))
+	} else {
+		log.Printf("Flushed DNS cache")
 	}
 
 	// Set MTU using netsh
@@ -176,9 +201,119 @@ func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error 
 	return nil
 }
 
-// cleanupWindowsDNS removes NRPT rules when shutting down
+// cleanupWindowsDNS removes NRPT rules and hosts file entries when shutting down
 func cleanupWindowsDNS() {
 	psCmd := `Get-DnsClientNrptRule | Where-Object {$_.Namespace -eq ".selftunnel"} | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue`
 	cmd := exec.Command("powershell", "-Command", psCmd)
 	cmd.Run() // Ignore errors during cleanup
+
+	// Clean up hosts file entries
+	cleanupHostsFile()
+}
+
+// hostsFilePath returns the path to Windows hosts file
+func hostsFilePath() string {
+	return filepath.Join(os.Getenv("SystemRoot"), "System32", "drivers", "etc", "hosts")
+}
+
+// addHostsEntry adds an entry to the Windows hosts file for DNS resolution fallback
+func addHostsEntry(ip, hostname string) error {
+	hostsPath := hostsFilePath()
+
+	// Read existing content
+	content, err := os.ReadFile(hostsPath)
+	if err != nil {
+		return fmt.Errorf("failed to read hosts file: %w", err)
+	}
+
+	// Check if entry already exists
+	entry := fmt.Sprintf("%s\t%s", ip, hostname)
+	if strings.Contains(string(content), entry) {
+		return nil // Already exists
+	}
+
+	// Check if hostname exists with different IP (update it)
+	lines := strings.Split(string(content), "\n")
+	updated := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasSuffix(trimmed, "\t"+hostname) || strings.HasSuffix(trimmed, " "+hostname) {
+			lines[i] = entry
+			updated = true
+			break
+		}
+	}
+
+	var newContent string
+	if updated {
+		newContent = strings.Join(lines, "\n")
+	} else {
+		// Append new entry with selftunnel marker
+		marker := "# SelfTunnel DNS entry"
+		if !strings.Contains(string(content), marker) {
+			newContent = string(content) + "\n\n" + marker + "\n"
+		} else {
+			newContent = string(content) + "\n"
+		}
+		newContent += entry
+	}
+
+	// Write back
+	if err := os.WriteFile(hostsPath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write hosts file: %w", err)
+	}
+
+	log.Printf("Added hosts entry: %s -> %s", hostname, ip)
+	return nil
+}
+
+// cleanupHostsFile removes SelfTunnel entries from hosts file
+func cleanupHostsFile() {
+	hostsPath := hostsFilePath()
+
+	content, err := os.ReadFile(hostsPath)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var newLines []string
+	inSelfTunnelSection := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect start of SelfTunnel section
+		if strings.Contains(trimmed, "# SelfTunnel DNS entry") {
+			inSelfTunnelSection = true
+			continue
+		}
+
+		// Skip .selftunnel entries
+		if strings.Contains(trimmed, ".selftunnel") {
+			continue
+		}
+
+		// End SelfTunnel section on next comment or empty line after entries
+		if inSelfTunnelSection && (trimmed == "" || strings.HasPrefix(trimmed, "#")) {
+			inSelfTunnelSection = false
+		}
+
+		if !inSelfTunnelSection {
+			newLines = append(newLines, line)
+		}
+	}
+
+	os.WriteFile(hostsPath, []byte(strings.Join(newLines, "\n")), 0644)
+}
+
+// UpdateHostsForPeer adds a hosts file entry for a peer (call this when peers are discovered)
+func UpdateHostsForPeer(name, virtualIP, suffix string) {
+	if suffix == "" {
+		suffix = "selftunnel"
+	}
+	hostname := fmt.Sprintf("%s.%s", name, suffix)
+	if err := addHostsEntry(virtualIP, hostname); err != nil {
+		log.Printf("Warning: Could not add hosts entry for %s: %v", name, err)
+	}
 }

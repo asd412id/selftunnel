@@ -49,3 +49,8 @@ func createPlatformTUN(cfg TUNConfig) (TUNInterface, error) {
 func configureWindowsInterface(name, ip string, cidr *net.IPNet, mtu int) error {
 	return nil // No-op on Unix
 }
+
+// UpdateHostsForPeer stub for non-Windows builds
+func UpdateHostsForPeer(name, virtualIP, suffix string) {
+	// No-op on Unix - use DNS or /etc/hosts manually
+}

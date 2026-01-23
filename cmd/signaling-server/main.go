@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,6 +165,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		} else {
 			// Allocate a new unique IP
 			virtualIP = allocateUniqueIP(network)
+		}
+	}
+
+	// Check if name is already in use by another peer
+	for pk, existingPeer := range network.Peers {
+		if pk != req.Peer.PublicKey && strings.EqualFold(existingPeer.Name, req.Peer.Name) {
+			network.mu.Unlock()
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": fmt.Sprintf("Node name '%s' is already in use by another peer. Please use a unique name.", req.Peer.Name),
+			})
+			return
 		}
 	}
 

@@ -269,13 +269,15 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 		return nil, fmt.Errorf("no valid peer endpoints")
 	}
 
-	// Send punch packets at high rate for birthday attack
-	// For symmetric NAT, we need to hit the right port combination
-	ticker := time.NewTicker(10 * time.Millisecond) // Faster for birthday attack
+	// Send punch packets - reduced rate to avoid flooding
+	// Previous: 10ms ticker × 50 batch = 10000 packets/2s (too aggressive!)
+	// New: 50ms ticker × 10 batch = ~400 packets/2s (sufficient for NAT traversal)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	packetsSent := 0
-	batchSize := 50 // Send to multiple addresses per tick
+	batchSize := 10   // Reduced batch size
+	maxPackets := 500 // Cap total packets per punch attempt
 
 	for {
 		select {
@@ -292,6 +294,10 @@ func (hp *HolePuncher) SimultaneousPunch(ctx context.Context, peerEndpoints []st
 			}
 			return nil, fmt.Errorf("punch timeout")
 		case <-ticker.C:
+			// Stop if we've sent enough packets
+			if packetsSent >= maxPackets {
+				continue
+			}
 			// Send to a batch of addresses
 			for i := 0; i < batchSize && i < len(allAddrs); i++ {
 				idx := (packetsSent + i) % len(allAddrs)
@@ -339,9 +345,9 @@ func generateSymmetricNATPorts(addr *net.UDPAddr, portDelta int, seen map[string
 	}
 
 	// Strategy 3: Birthday attack - random ports in ephemeral range
-	// For symmetric NAT, both sides use random ports, so we try many combinations
+	// Reduced from 200 to 50 random ports to avoid network flooding
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 50; i++ {
 		// Focus on ephemeral port range (32768-65535) where most NATs allocate
 		port := 32768 + rng.Intn(32767)
 		predicted := &net.UDPAddr{IP: addr.IP, Port: port}

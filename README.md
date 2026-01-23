@@ -38,22 +38,46 @@ A peer-to-peer mesh VPN that allows you to securely connect multiple devices wit
 
 ### 1. Deploy Signaling Server
 
-The signaling server is a lightweight Go binary that coordinates peer discovery and provides relay fallback.
+The signaling server coordinates peer discovery and provides relay fallback. Choose one of these options:
 
-**Option A: Download from releases**
+**Option A: Use Public Signaling Server (Easiest)**
+
+SelfTunnel comes pre-configured with a public signaling server. Just skip to step 2!
+
+**Option B: Deploy to Cloudflare Workers (Recommended for Production)**
+
+Deploy your own signaling server on Cloudflare Workers for free:
+
 ```bash
+# Install Wrangler CLI
+npm install -g wrangler
+
+# Login to Cloudflare
+wrangler login
+
+# Deploy
+cd deploy/cloudflare-worker
+wrangler deploy
+```
+
+This gives you a URL like `https://selftunnel-signaling.YOUR_SUBDOMAIN.workers.dev`.
+
+See [deploy/cloudflare-worker/README.md](deploy/cloudflare-worker/README.md) for detailed instructions.
+
+**Option C: Self-host Go Binary**
+
+```bash
+# Download
 wget https://github.com/asd412id/selftunnel/releases/latest/download/signaling-server-linux-amd64
 chmod +x signaling-server-linux-amd64
 ./signaling-server-linux-amd64 --port 8080
-```
 
-**Option B: Build from source**
-```bash
+# Or build from source
 go build -o signaling-server ./cmd/signaling-server
 ./signaling-server --port 8080
 ```
 
-**Option C: Run with systemd**
+**Option D: Run with systemd**
 ```bash
 # Create service file
 sudo tee /etc/systemd/system/selftunnel-signaling.service > /dev/null <<EOF
@@ -76,7 +100,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now selftunnel-signaling
 ```
 
-**Option D: Run with Docker**
+**Option E: Run with Docker**
 ```bash
 # Build image
 docker build -t selftunnel-signaling -f Dockerfile.signaling .
@@ -85,7 +109,7 @@ docker build -t selftunnel-signaling -f Dockerfile.signaling .
 docker run -d --name signaling -p 8080:8080 selftunnel-signaling
 ```
 
-**Reverse Proxy (recommended for production)**
+**Reverse Proxy (for self-hosted options)**
 
 Use nginx or caddy to add HTTPS:
 ```nginx
@@ -250,7 +274,7 @@ For named instances, config is stored in subdirectory (e.g., `/etc/selftunnel/of
   "virtual_cidr": "10.99.0.0/24",
   "listen_port": 51820,
   "mtu": 1420,
-  "signaling_url": "https://signaling.example.com",
+  "signaling_url": "https://selftunnel-signaling.YOUR_SUBDOMAIN.workers.dev",
   "stun_servers": [
     "stun:stun.l.google.com:19302",
     "stun:stun1.l.google.com:19302",
@@ -258,6 +282,21 @@ For named instances, config is stored in subdirectory (e.g., `/etc/selftunnel/of
   ]
 }
 ```
+
+### Custom Signaling Server
+
+To use your own signaling server, specify `--signaling-url` when initializing:
+
+```bash
+# Using Cloudflare Worker
+selftunnel init --name "my-laptop" --signaling-url "https://selftunnel-signaling.YOUR_SUBDOMAIN.workers.dev"
+
+# Using self-hosted server
+selftunnel init --name "my-laptop" --signaling-url "https://signaling.yourdomain.com"
+```
+
+Or edit the config file directly after initialization.
+
 
 ## Deploy to Ubuntu Server
 

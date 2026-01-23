@@ -12,12 +12,14 @@ import (
 )
 
 const (
-	WGHeaderSize    = 16
-	WGKeepalive     = 25 * time.Second
-	WGHandshakeInit = 1
-	WGHandshakeResp = 2
-	WGDataPacket    = 4
-	WGCookieReply   = 3
+	WGHeaderSize       = 16
+	WGKeepalive        = 25 * time.Second
+	WGHandshakeInit    = 1
+	WGHandshakeResp    = 2
+	WGDataPacket       = 4
+	WGCookieReply      = 3
+	DirectGracePeriod  = 5 * time.Second // Keep relay active for 5s after direct is established
+	DirectConfirmCount = 3               // Need 3 direct packets to confirm connection
 )
 
 // RelaySender interface for sending data via relay
@@ -46,17 +48,20 @@ type WireGuardTunnel struct {
 }
 
 type WGPeer struct {
-	PublicKey     [crypto.KeySize]byte
-	PublicKeyB64  string // base64 encoded public key for relay lookup
-	Endpoint      *net.UDPAddr
-	AllowedIPs    []*net.IPNet
-	LastSeen      time.Time
-	TxBytes       uint64
-	RxBytes       uint64
-	Keepalive     time.Duration
-	sharedSecret  [crypto.KeySize]byte
-	relayFallback bool // true if using relay instead of direct UDP
-	mu            sync.RWMutex
+	PublicKey         [crypto.KeySize]byte
+	PublicKeyB64      string // base64 encoded public key for relay lookup
+	Endpoint          *net.UDPAddr
+	AllowedIPs        []*net.IPNet
+	LastSeen          time.Time
+	LastDirectReceive time.Time // last time we received data via direct UDP
+	TxBytes           uint64
+	RxBytes           uint64
+	Keepalive         time.Duration
+	sharedSecret      [crypto.KeySize]byte
+	relayFallback     bool      // true if using relay instead of direct UDP
+	directGracePeriod bool      // true during grace period after direct is established
+	directGraceStart  time.Time // when grace period started
+	mu                sync.RWMutex
 }
 
 type WireGuardConfig struct {
@@ -417,21 +422,44 @@ func (wg *WireGuardTunnel) checkPeerHealth() {
 	for _, peer := range wg.peers {
 		peer.mu.Lock()
 		lastSeen := peer.LastSeen
+		lastDirectReceive := peer.LastDirectReceive
 		wasUsingRelay := peer.relayFallback
+		inGracePeriod := peer.directGracePeriod
 		hasEndpoint := peer.Endpoint != nil
 		peerKey := peer.PublicKeyB64
 
 		needReconnect := false
 
-		// If we have a direct endpoint but haven't received data in 5+ seconds,
-		// enable relay fallback (connection might be broken)
-		// Reduced from 30s to 5s for faster recovery on IP changes
-		if hasEndpoint && !wasUsingRelay && !lastSeen.IsZero() {
-			if time.Since(lastSeen) > 5*time.Second {
+		// End grace period if it's been long enough
+		if inGracePeriod && time.Since(peer.directGraceStart) > DirectGracePeriod {
+			peer.directGracePeriod = false
+			inGracePeriod = false
+			log.Printf("[Health] Peer %s grace period ended", peerKey[:16])
+		}
+
+		// Only check health if we're NOT using relay (i.e., direct-only mode)
+		// If relay is still active, connection is fine via relay
+		if !wasUsingRelay && !inGracePeriod {
+			// We thought direct was working, check if it's still working
+			if hasEndpoint && !lastDirectReceive.IsZero() {
+				// Had direct data before, check if it's stale
+				if time.Since(lastDirectReceive) > 30*time.Second {
+					peer.relayFallback = true
+					needReconnect = true
+					log.Printf("[Health] Peer %s direct connection stale (last direct %v ago), enabling relay", peerKey[:16], time.Since(lastDirectReceive))
+				}
+			} else if hasEndpoint && lastDirectReceive.IsZero() {
+				// Never received direct data - this shouldn't happen if relayFallback is false
+				// But if it does, re-enable relay
 				peer.relayFallback = true
-				needReconnect = true
-				log.Printf("[Health] Peer %s direct connection stale (last seen %v ago), enabling relay fallback", peerKey[:16], time.Since(lastSeen))
+				log.Printf("[Health] Peer %s never received direct traffic (unexpected state), enabling relay", peerKey[:16])
 			}
+		}
+
+		// If peer hasn't been seen at all (neither direct nor relay) for a long time, trigger reconnect
+		if !lastSeen.IsZero() && time.Since(lastSeen) > 60*time.Second {
+			needReconnect = true
+			log.Printf("[Health] Peer %s not seen for %v, triggering reconnect", peerKey[:16], time.Since(lastSeen))
 		}
 
 		peer.mu.Unlock()
@@ -468,6 +496,10 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 	if dstIP.IsLinkLocalMulticast() || dstIP.IsLinkLocalUnicast() {
 		return
 	}
+	// Skip subnet broadcast (e.g., 10.99.0.255 for /24)
+	if len(dstIP) == 4 && dstIP[3] == 255 {
+		return
+	}
 
 	peer := wg.findPeerForIP(dstIP)
 	if peer == nil {
@@ -494,8 +526,19 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 	peer.mu.RLock()
 	endpoint := peer.Endpoint
 	useRelay := peer.relayFallback
+	inGracePeriod := peer.directGracePeriod
+	graceStart := peer.directGraceStart
+	lastDirectReceive := peer.LastDirectReceive
 	peerKey := peer.PublicKeyB64
 	peer.mu.RUnlock()
+
+	// Check if grace period has expired
+	if inGracePeriod && time.Since(graceStart) > DirectGracePeriod {
+		peer.mu.Lock()
+		peer.directGracePeriod = false
+		inGracePeriod = false
+		peer.mu.Unlock()
+	}
 
 	directSent := false
 	relaySent := false
@@ -513,27 +556,31 @@ func (wg *WireGuardTunnel) handleOutbound(packet []byte) {
 		}
 	}
 
-	// ALWAYS use relay as backup when:
-	// - relayFallback is true (direct not yet proven), OR
-	// - No endpoint available, OR
-	// - Direct send failed
+	// ALWAYS use relay as backup path unless direct is proven to work bidirectionally
+	// This handles asymmetric NAT where one direction works but not the other
 	wg.relayMu.RLock()
 	relay := wg.relay
 	wg.relayMu.RUnlock()
 
-	if relay != nil && relay.IsConnected() && peerKey != "" {
-		// Use relay if: no direct endpoint, direct failed, or relay mode is active
-		if endpoint == nil || !directSent || useRelay {
-			if err := relay.Send(peerKey, encrypted); err == nil {
-				relaySent = true
-				if !directSent {
-					peer.mu.Lock()
-					peer.TxBytes += uint64(len(packet))
-					peer.mu.Unlock()
-				}
-			} else {
-				log.Printf("[Relay] Send failed: %v (packet size: %d)", err, len(encrypted))
+	// Use relay when:
+	// - relayFallback is true (haven't received direct data yet), OR
+	// - In grace period (transitioning from relay to direct), OR
+	// - No endpoint (can't send direct), OR
+	// - Direct send failed, OR
+	// - Haven't received direct data recently (>10s) - connection might be one-way
+	directWorking := !lastDirectReceive.IsZero() && time.Since(lastDirectReceive) < 10*time.Second
+	shouldUseRelay := useRelay || inGracePeriod || endpoint == nil || !directSent || !directWorking
+
+	if relay != nil && relay.IsConnected() && peerKey != "" && shouldUseRelay {
+		if err := relay.Send(peerKey, encrypted); err == nil {
+			relaySent = true
+			if !directSent {
+				peer.mu.Lock()
+				peer.TxBytes += uint64(len(packet))
+				peer.mu.Unlock()
 			}
+		} else {
+			log.Printf("[Relay] Send failed: %v (packet size: %d)", err, len(encrypted))
 		}
 	}
 
@@ -579,12 +626,15 @@ func (wg *WireGuardTunnel) handleInbound(packet []byte, addr *net.UDPAddr) {
 }
 
 // updatePeerFromPunch updates peer endpoint when receiving punch from unknown address
+// NOTE: This only sets the endpoint, does NOT disable relay - relay is only disabled
+// when we actually receive DATA packets via direct connection
 func (wg *WireGuardTunnel) updatePeerFromPunch(addr *net.UDPAddr) {
-	// Skip virtual IPs and private IPs
+	// Skip virtual IPs and private IPs (except Tailscale 100.x.x.x which is routable)
 	ip4 := addr.IP.To4()
 	if ip4 == nil {
 		return
 	}
+	// Skip local-only ranges
 	if ip4[0] == 10 || (ip4[0] == 192 && ip4[1] == 168) || (ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) || ip4[0] == 127 {
 		return
 	}
@@ -592,27 +642,30 @@ func (wg *WireGuardTunnel) updatePeerFromPunch(addr *net.UDPAddr) {
 	wg.peersMu.Lock()
 	defer wg.peersMu.Unlock()
 
+	// Find peer that needs endpoint update
 	for _, peer := range wg.peers {
 		peer.mu.Lock()
-		// Update if peer has no endpoint, is using relay, or endpoint doesn't match
-		needUpdate := peer.Endpoint == nil || peer.relayFallback
-		if needUpdate {
-			oldEndpoint := peer.Endpoint
-			peer.Endpoint = addr
-			peer.relayFallback = false
-			peer.LastSeen = time.Now()
-			if oldEndpoint == nil {
-				log.Printf("[WG] Peer %s: endpoint set to %s (direct ENABLED)", peer.PublicKeyB64[:16], addr)
-			} else {
-				log.Printf("[WG] Peer %s: endpoint %s -> %s (direct ENABLED)", peer.PublicKeyB64[:16], oldEndpoint, addr)
-			}
-		} else if peer.Endpoint != nil && peer.Endpoint.String() != addr.String() {
-			// Different endpoint - NAT rebinding, update silently
+		oldEndpoint := peer.Endpoint
+
+		// Skip if this peer already has this exact endpoint
+		if oldEndpoint != nil && oldEndpoint.String() == addr.String() {
+			peer.mu.Unlock()
+			continue
+		}
+
+		// Only set endpoint if peer has NO endpoint yet
+		// Don't keep switching endpoints - that causes instability
+		// Once we have an endpoint, stick with it until direct data proves it works or health check resets it
+		if oldEndpoint == nil {
 			peer.Endpoint = addr
 			peer.LastSeen = time.Now()
+			log.Printf("[WG] Peer %s: initial endpoint set to %s", peer.PublicKeyB64[:16], addr)
+			peer.mu.Unlock()
+			return // Only update one peer per punch
 		}
 		peer.mu.Unlock()
 	}
+	// No log if no peer was updated - this is normal during hole punching
 }
 
 func (wg *WireGuardTunnel) handleHandshakeInit(packet []byte, addr *net.UDPAddr) {
@@ -633,22 +686,25 @@ func (wg *WireGuardTunnel) handleDataPacket(packet []byte, addr *net.UDPAddr) {
 	peer := wg.findPeerByEndpoint(addr)
 	if peer == nil {
 		// Try to find any peer that might match (for new connections)
+		// Try decryption with each peer's shared secret
 		wg.peersMu.RLock()
 		for _, p := range wg.peers {
-			p.mu.RLock()
-			// Accept from any peer that is using relay or has no endpoint
-			if p.relayFallback || p.Endpoint == nil {
-				peer = p
-				p.mu.RUnlock()
-				break
+			// Try to decrypt with this peer's secret
+			decrypted := wg.decryptWithSecret(packet, p.sharedSecret)
+			if decrypted != nil && len(decrypted) >= 20 {
+				// Check if it looks like a valid IP packet
+				version := decrypted[0] >> 4
+				if version == 4 || version == 6 {
+					peer = p
+					break
+				}
 			}
-			p.mu.RUnlock()
 		}
 		wg.peersMu.RUnlock()
 	}
 
 	if peer == nil {
-		log.Printf("[WG] Received data from unknown endpoint %s, no matching peer", addr)
+		// Don't log every unknown packet - too spammy during hole punching
 		return
 	}
 
@@ -669,19 +725,35 @@ func (wg *WireGuardTunnel) handleDataPacket(packet []byte, addr *net.UDPAddr) {
 	peer.mu.Lock()
 	peer.RxBytes += uint64(len(decrypted))
 	peer.LastSeen = time.Now()
+	peer.LastDirectReceive = time.Now()
 	peerKeyB64 := peer.PublicKeyB64
+	oldEndpoint := peer.Endpoint
 
-	// Update endpoint if changed
-	if peer.Endpoint == nil || peer.Endpoint.String() != addr.String() {
+	// Update endpoint if changed - this is the REAL working endpoint
+	endpointChanged := oldEndpoint == nil || oldEndpoint.String() != addr.String()
+	if endpointChanged {
 		peer.Endpoint = addr
 	}
 
-	// Direct connection confirmed working - disable relay fallback
+	// Direct connection confirmed working
+	// Start grace period instead of immediately disabling relay
+	wasUsingRelay := peer.relayFallback
 	if peer.relayFallback {
 		peer.relayFallback = false
-		log.Printf("[Direct] Data received from %s (%d bytes), relay DISABLED", addr, n)
+		peer.directGracePeriod = true
+		peer.directGraceStart = time.Now()
+	} else if peer.directGracePeriod {
+		// Still in grace period, check if we can end it early
+		if time.Since(peer.directGraceStart) > 2*time.Second {
+			peer.directGracePeriod = false
+		}
 	}
 	peer.mu.Unlock()
+
+	// Only log significant events
+	if wasUsingRelay {
+		log.Printf("[Direct] Peer %s: direct connection established via %s (%d bytes)", peerKeyB64[:16], addr, n)
+	}
 
 	// Notify callback that we received data from this peer (direct connection)
 	if wg.onDataReceived != nil {

@@ -1,0 +1,27 @@
+name = "selftunnel-signaling"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Durable Objects for stateful network management
+[durable_objects]
+bindings = [
+  { name = "NETWORK_STATE", class_name = "NetworkState" }
+]
+
+# Migrate Durable Objects (required for first deploy)
+[[migrations]]
+tag = "v1"
+new_classes = ["NetworkState"]
+
+# Optional: Custom domain
+# routes = [
+#   { pattern = "signaling.yourdomain.com", custom_domain = true }
+# ]
+
+# Optional: Enable analytics
+# [analytics_engine]
+# enable = true
+
+# Environment variables (if needed)
+# [vars]
+# ENVIRONMENT = "production"

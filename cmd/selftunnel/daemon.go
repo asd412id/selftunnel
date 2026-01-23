@@ -377,8 +377,9 @@ func (d *Daemon) connectRelay() {
 		currentState := peer.GetState()
 		lastSeen := peer.GetLastSeen()
 
-		if currentState == mesh.PeerStateConnected && time.Since(lastSeen) < 30*time.Second {
-			log.Printf("[Punch] Ignoring punch request from %s - already connected (last seen %v ago)", peer.Name, time.Since(lastSeen))
+		// More conservative: only retry if truly stale (>60s) or disconnected
+		if currentState == mesh.PeerStateConnected && time.Since(lastSeen) < 60*time.Second {
+			log.Printf("[Punch] Ignoring punch request from %s - already connected (last seen %v ago)", peer.Name, time.Since(lastSeen).Round(time.Second))
 			return
 		}
 
@@ -402,8 +403,14 @@ func (d *Daemon) connectRelay() {
 		peer.SetEndpoints(mergedEndpoints)
 		log.Printf("[Punch] Merged %d endpoints for peer %s", len(mergedEndpoints), peer.Name)
 
-		// Mark peer as connecting so we accept incoming punch
-		peer.SetState(mesh.PeerStateConnecting)
+		// Only mark as connecting if not already connected
+		// Don't disturb working connections
+		if peer.GetState() != mesh.PeerStateConnected {
+			peer.SetState(mesh.PeerStateConnecting)
+		}
+
+		// Update LastSeen to prevent false stale detection
+		peer.UpdateLastSeen(false)
 
 		// Start hole punching in background
 		go d.discovery.ConnectToPeer(from)
@@ -483,8 +490,14 @@ func (d *Daemon) handlePeersUpdate(peers []*mesh.Peer) {
 
 		existing := d.peerManager.GetPeer(peer.PublicKey)
 		if existing == nil {
+			// Initialize LastSeen to now when adding new peer
+			// This prevents false "stale connection" detection
+			peer.LastSeen = time.Now()
 			d.peerManager.AddPeer(peer)
 			log.Printf("New peer discovered: %s (%s)", peer.Name, peer.VirtualIP)
+
+			// Add hosts file entry for DNS resolution (Windows)
+			tunnel.UpdateHostsForPeer(peer.Name, peer.VirtualIP, d.cfg.DNSSuffix)
 
 			// Add to WireGuard if tunnel is running
 			if d.wg != nil {

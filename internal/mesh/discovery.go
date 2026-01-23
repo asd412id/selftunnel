@@ -18,6 +18,7 @@ type Discovery struct {
 	relayClient   *relay.Client
 	onDiscovered  func(*Peer, *nat.MappedAddress)
 	onPeerConnect func(publicKey string, endpoint string) // callback when direct connection established
+	punchCooldown map[string]time.Time                    // track last punch attempt per peer
 	mu            sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -28,10 +29,11 @@ func NewDiscovery(pm *PeerManager, hp *nat.HolePuncher) *Discovery {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Discovery{
-		peerManager: pm,
-		holePuncher: hp,
-		ctx:         ctx,
-		cancel:      cancel,
+		peerManager:   pm,
+		holePuncher:   hp,
+		punchCooldown: make(map[string]time.Time),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -126,7 +128,7 @@ func (d *Discovery) maintenanceLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	retryTicker := time.NewTicker(3 * time.Second) // Retry direct connection every 3s (reduced from 60s)
+	retryTicker := time.NewTicker(10 * time.Second) // Retry direct connection every 10s
 	defer retryTicker.Stop()
 
 	for {
@@ -177,9 +179,8 @@ func (d *Discovery) retryDirectConnections() {
 		// IMPORTANT: Don't disturb working connections!
 		// Only retry if:
 		// 1. Peer is disconnected
-		// 2. Peer is stuck in connecting for too long (>5s)
-		// 3. Peer is connected but hasn't been seen in >5s (stale connection)
-		// Reduced from 60s to 5s for faster recovery
+		// 2. Peer is stuck in connecting for too long (>30s)
+		// 3. Peer is connected but hasn't been seen in >30s (stale connection)
 		shouldRetry := false
 		reason := ""
 
@@ -188,16 +189,18 @@ func (d *Discovery) retryDirectConnections() {
 			shouldRetry = true
 			reason = "disconnected"
 		case PeerStateConnecting:
-			// Only retry if stuck for more than 5 seconds
-			if time.Since(lastSeen) > 5*time.Second {
+			// Only retry if stuck for more than 30 seconds
+			if time.Since(lastSeen) > 30*time.Second {
 				shouldRetry = true
-				reason = fmt.Sprintf("stuck connecting for %v", time.Since(lastSeen))
+				reason = fmt.Sprintf("stuck connecting for %v", time.Since(lastSeen).Round(time.Second))
 			}
 		case PeerStateConnected:
-			// Only retry if truly stale (>5s without activity)
-			if time.Since(lastSeen) > 5*time.Second {
+			// Only retry if truly stale (>30s without activity)
+			// 30s is long enough to avoid disrupting working connections
+			// but short enough to recover from failed connections
+			if time.Since(lastSeen) > 30*time.Second {
 				shouldRetry = true
-				reason = fmt.Sprintf("stale connection (last seen %v ago)", time.Since(lastSeen))
+				reason = fmt.Sprintf("stale connection (last seen %v ago)", time.Since(lastSeen).Round(time.Second))
 			}
 			// If recently seen, DO NOT retry - connection is working!
 		}
@@ -223,7 +226,6 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 		peer.mu.Unlock()
 		return
 	}
-	peer.State = PeerStateConnecting
 	endpoints := peer.Endpoints
 	publicKey := peer.PublicKey
 	peerName := peer.Name
@@ -231,11 +233,22 @@ func (d *Discovery) attemptConnection(peer *Peer) {
 
 	if len(endpoints) == 0 {
 		log.Printf("[Discovery] No endpoints for peer %s, skipping", peerName)
-		peer.mu.Lock()
-		peer.State = PeerStateDisconnected
-		peer.mu.Unlock()
 		return
 	}
+
+	// Check cooldown - don't punch same peer more than once per 30 seconds
+	d.mu.Lock()
+	lastPunch, exists := d.punchCooldown[publicKey]
+	if exists && time.Since(lastPunch) < 30*time.Second {
+		d.mu.Unlock()
+		return
+	}
+	d.punchCooldown[publicKey] = time.Now()
+	d.mu.Unlock()
+
+	peer.mu.Lock()
+	peer.State = PeerStateConnecting
+	peer.mu.Unlock()
 
 	// Get our endpoints to share with peer
 	myEndpoints := d.holePuncher.GetEndpoints()
