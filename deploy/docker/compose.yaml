@@ -3,7 +3,6 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
-    image: selftunnel-signaling:latest
     container_name: selftunnel-signaling
     restart: unless-stopped
     environment:
