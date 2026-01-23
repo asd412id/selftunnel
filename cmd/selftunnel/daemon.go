@@ -207,8 +207,9 @@ func (d *Daemon) Start() error {
 	d.signaling.Start()
 	d.discovery.Start()
 
-	// Start DNS server if enabled
-	if d.cfg.DNSEnabled {
+	// Start DNS server if enabled AND tunnel is running
+	// DNS binds to VirtualIP which only exists if TUN interface is created
+	if d.cfg.DNSEnabled && (d.tun != nil || d.nativeWG != nil) {
 		// Use port 53 if config has old default port
 		dnsPort := d.cfg.DNSPort
 		if dnsPort == 53530 || dnsPort == 5353 {
@@ -225,6 +226,8 @@ func (d *Daemon) Start() error {
 		if err := d.dnsServer.Start(); err != nil {
 			log.Printf("Warning: Could not start DNS server: %v", err)
 		}
+	} else if d.cfg.DNSEnabled {
+		log.Printf("Warning: DNS server not started - no tunnel interface available")
 	}
 
 	log.Println("SelfTunnel daemon started successfully")

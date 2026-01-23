@@ -14,18 +14,20 @@ var wintunDLL embed.FS
 const dllName = "wintun.dll"
 
 // EnsureWinTUN extracts wintun.dll to system directory if needed
+// DEPRECATED: Use ExtractToPath for proper DLL placement.
+// The wintun library only searches Application Dir and System32.
 func EnsureWinTUN() error {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
 
-	// Check if wintun.dll already exists in System32 or current directory
+	// Check if wintun.dll already exists in System32
 	systemPath := filepath.Join(os.Getenv("SystemRoot"), "System32", dllName)
 	if fileExists(systemPath) {
 		return nil
 	}
 
-	// Try to extract to temp directory
+	// Try to extract to temp directory (legacy behavior, may not work)
 	tempDir := os.TempDir()
 	dllPath := filepath.Join(tempDir, dllName)
 
@@ -43,10 +45,41 @@ func EnsureWinTUN() error {
 		return fmt.Errorf("failed to write wintun.dll: %w", err)
 	}
 
-	// Add to PATH
+	// Add to PATH (note: this may not help as wintun library doesn't use PATH)
 	os.Setenv("PATH", tempDir+";"+os.Getenv("PATH"))
 
 	return nil
+}
+
+// ExtractToPath extracts the embedded wintun.dll to the specified path
+func ExtractToPath(dllPath string) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+
+	// Read embedded DLL
+	data, err := wintunDLL.ReadFile("dll/wintun.dll")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded wintun.dll: %w", err)
+	}
+
+	// Ensure parent directory exists
+	dir := filepath.Dir(dllPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	// Write DLL to target path
+	if err := os.WriteFile(dllPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write wintun.dll to %s: %w", dllPath, err)
+	}
+
+	return nil
+}
+
+// GetEmbeddedDLL returns the embedded wintun.dll data
+func GetEmbeddedDLL() ([]byte, error) {
+	return wintunDLL.ReadFile("dll/wintun.dll")
 }
 
 // InstallWinTUN installs wintun.dll to System32 (requires admin)

@@ -96,8 +96,12 @@ func (w *WindowsTUN) Name() string {
 }
 
 // ensureWintunDLL extracts wintun.dll to executable directory if needed
+// IMPORTANT: The golang.zx2c4.com/wintun library uses LoadLibraryEx with
+// LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32
+// This means it ONLY searches the application directory and System32.
+// It does NOT search PATH, temp directory, or current working directory.
 func ensureWintunDLL() error {
-	// Get executable directory
+	// Get executable directory - this is where wintun library will search
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to get executable path: %w", err)
@@ -105,18 +109,32 @@ func ensureWintunDLL() error {
 	exeDir := filepath.Dir(exePath)
 	dllPath := filepath.Join(exeDir, "wintun.dll")
 
-	// Check if DLL already exists
+	// Check if DLL already exists in exe directory
 	if _, err := os.Stat(dllPath); err == nil {
 		log.Printf("wintun.dll found at %s", dllPath)
 		return nil
 	}
 
-	// Try to extract from embedded wintun package
-	if err := wintun.EnsureWinTUN(); err != nil {
-		return fmt.Errorf("failed to ensure wintun: %w", err)
+	// Also check System32 as fallback
+	systemPath := filepath.Join(os.Getenv("SystemRoot"), "System32", "wintun.dll")
+	if _, err := os.Stat(systemPath); err == nil {
+		log.Printf("wintun.dll found at %s", systemPath)
+		return nil
 	}
 
-	log.Printf("wintun.dll extracted successfully")
+	// Extract embedded DLL directly to exe directory
+	log.Printf("Extracting wintun.dll to %s", dllPath)
+	if err := wintun.ExtractToPath(dllPath); err != nil {
+		// Try System32 as fallback (requires admin)
+		log.Printf("Failed to extract to exe directory: %v, trying System32...", err)
+		if err2 := wintun.InstallWinTUN(); err2 != nil {
+			return fmt.Errorf("failed to extract wintun.dll: exe dir error: %v, system32 error: %w", err, err2)
+		}
+		log.Printf("wintun.dll installed to System32")
+		return nil
+	}
+
+	log.Printf("wintun.dll extracted successfully to %s", dllPath)
 	return nil
 }
 
