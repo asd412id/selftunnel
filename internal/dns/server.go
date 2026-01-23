@@ -124,8 +124,14 @@ func (s *Server) serve() {
 		default:
 		}
 
+		// FIX: bug.production.1 - Add read deadline to prevent blocking forever
+		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		n, remoteAddr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
+			// Check for timeout - this is expected, just continue to check stopCh
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			s.mu.RLock()
 			running := s.running
 			s.mu.RUnlock()

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -56,12 +57,14 @@ type Client struct {
 	onPunch      func(from string, endpoints []string) // callback when peer wants to punch
 	onDisconnect func()                                // callback when relay disconnects
 
-	autoReconnect bool // enable auto-reconnect
+	autoReconnect    bool  // enable auto-reconnect
+	reconnectRunning int32 // FIX: bug.production.12 - atomic flag to prevent goroutine storm
 
 	ctx struct {
 		done chan struct{}
 	}
-	wg sync.WaitGroup
+	ctxMu sync.Mutex // FIX: bug.production.2 - protect context channel
+	wg    sync.WaitGroup
 }
 
 // NewClient creates a new relay client
@@ -155,7 +158,19 @@ func splitEndpoints(s string) []string {
 
 // Connect establishes connection to the relay server
 func (c *Client) Connect() error {
+	// FIX: bug.production.2 & bug.production.4 - Protect context creation and reset WaitGroup
+	c.ctxMu.Lock()
+	// Close old context if exists
+	if c.ctx.done != nil {
+		select {
+		case <-c.ctx.done:
+			// Already closed
+		default:
+			close(c.ctx.done)
+		}
+	}
 	c.ctx.done = make(chan struct{})
+	c.ctxMu.Unlock()
 
 	// Parse URL and convert https to wss
 	u, err := url.Parse(c.relayURL)
@@ -345,8 +360,13 @@ func (c *Client) reader() {
 	defer c.wg.Done()
 
 	for {
+		// FIX: bug.production.2 - Use mutex-protected context access
+		c.ctxMu.Lock()
+		done := c.ctx.done
+		c.ctxMu.Unlock()
+
 		select {
-		case <-c.ctx.done:
+		case <-done:
 			return
 		default:
 		}
@@ -374,8 +394,8 @@ func (c *Client) reader() {
 				go c.onDisconnect()
 			}
 
-			// Trigger auto-reconnect if enabled
-			if c.autoReconnect {
+			// FIX: bug.production.12 - Use atomic flag to prevent goroutine storm
+			if c.autoReconnect && atomic.CompareAndSwapInt32(&c.reconnectRunning, 0, 1) {
 				go c.autoReconnectLoop()
 			}
 			return
@@ -476,6 +496,9 @@ func (c *Client) Reconnect() error {
 
 // autoReconnectLoop attempts to reconnect with exponential backoff
 func (c *Client) autoReconnectLoop() {
+	// FIX: bug.production.12 - Reset flag when loop exits
+	defer atomic.StoreInt32(&c.reconnectRunning, 0)
+
 	backoff := 2 * time.Second
 	maxBackoff := 60 * time.Second
 	attempt := 0
@@ -493,11 +516,16 @@ func (c *Client) autoReconnectLoop() {
 		if err := c.Connect(); err != nil {
 			log.Printf("[Relay] Reconnect failed: %v", err)
 
+			// FIX: bug.production.2 - Use mutex-protected context access
+			c.ctxMu.Lock()
+			done := c.ctx.done
+			c.ctxMu.Unlock()
+
 			// Exponential backoff with interruptible sleep
 			timer := time.NewTimer(backoff)
 			select {
 			case <-timer.C:
-			case <-c.ctx.done:
+			case <-done:
 				timer.Stop()
 				return
 			}

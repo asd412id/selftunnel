@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -334,12 +335,30 @@ func (c *Client) heartbeatLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// FIX: bug.production.6 - Track consecutive failures
+	consecutiveFailures := 0
+	maxFailures := 3
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			c.Heartbeat()
+			if err := c.Heartbeat(); err != nil {
+				consecutiveFailures++
+				log.Printf("[Signaling] Heartbeat failed (%d/%d): %v", consecutiveFailures, maxFailures, err)
+				if consecutiveFailures >= maxFailures {
+					log.Printf("[Signaling] Too many heartbeat failures, attempting re-registration")
+					if _, err := c.Register(); err != nil {
+						log.Printf("[Signaling] Re-registration failed: %v", err)
+					} else {
+						consecutiveFailures = 0
+						log.Printf("[Signaling] Re-registration successful")
+					}
+				}
+			} else {
+				consecutiveFailures = 0
+			}
 		}
 	}
 }
@@ -380,12 +399,11 @@ func (c *Client) peerPollingLoop() {
 }
 
 // filterChangedPeers returns only peers that are new or have changed endpoints
+// FIX: bug.production.7 - Avoid potential deadlock by minimizing time under lock
 func (c *Client) filterChangedPeers(peers []*mesh.Peer) []*mesh.Peer {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var changed []*mesh.Peer
-	newState := make(map[string]string)
+	// Build new state map outside the lock
+	newState := make(map[string]string, len(peers))
+	peerHashes := make(map[string]string, len(peers))
 
 	for _, peer := range peers {
 		// Create state hash from endpoints
@@ -393,17 +411,23 @@ func (c *Client) filterChangedPeers(peers []*mesh.Peer) []*mesh.Peer {
 		for _, ep := range peer.Endpoints {
 			endpointHash += ep + ","
 		}
+		peerHashes[peer.PublicKey] = endpointHash
 		newState[peer.PublicKey] = endpointHash
+	}
 
-		// Check if peer is new or endpoints changed
+	// Now acquire lock only for comparison and state update
+	c.mu.Lock()
+	var changed []*mesh.Peer
+	for _, peer := range peers {
+		hash := peerHashes[peer.PublicKey]
 		oldHash, exists := c.lastPeerState[peer.PublicKey]
-		if !exists || oldHash != endpointHash {
+		if !exists || oldHash != hash {
 			changed = append(changed, peer)
 		}
 	}
-
 	// Update cached state
 	c.lastPeerState = newState
+	c.mu.Unlock()
 
 	return changed
 }

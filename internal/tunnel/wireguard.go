@@ -717,7 +717,10 @@ func (wg *WireGuardTunnel) handleDataPacket(packet []byte, addr *net.UDPAddr) {
 	if peer == nil {
 		// Try to find any peer that might match (for new connections)
 		// Try decryption with each peer's shared secret
+		// FIX: bug.production.9 - Log warning about brute-force decryption attempt
+		// This is expensive O(n) operation; in production consider caching or protocol change
 		wg.peersMu.RLock()
+		peerCount := len(wg.peers)
 		for _, p := range wg.peers {
 			// Try to decrypt with this peer's secret
 			decrypted := wg.decryptWithSecret(packet, p.sharedSecret)
@@ -731,6 +734,11 @@ func (wg *WireGuardTunnel) handleDataPacket(packet []byte, addr *net.UDPAddr) {
 			}
 		}
 		wg.peersMu.RUnlock()
+
+		// Log warning if we had to try multiple peers (performance concern)
+		if peer != nil && peerCount > 5 {
+			log.Printf("[WG] Warning: brute-force decryption across %d peers for endpoint %s", peerCount, addr)
+		}
 	}
 
 	if peer == nil {
@@ -798,6 +806,8 @@ func (wg *WireGuardTunnel) encryptPacket(plaintext []byte, peer *WGPeer) []byte 
 	peer.mu.RUnlock()
 
 	if encryptor == nil {
+		// FIX: bug.production.3 - Log warning when encryptor is nil
+		log.Printf("[WG] Warning: encryptor is nil for peer, packet dropped")
 		return nil
 	}
 

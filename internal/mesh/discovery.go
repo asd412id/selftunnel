@@ -196,7 +196,11 @@ func (d *Discovery) maintainConnections() {
 		}(peer)
 	}
 
-	// Wait with timeout to prevent blocking forever
+	// FIX: bug.production.10 - Use context-aware timeout instead of separate timer
+	// This ensures the wait is interruptible by context cancellation
+	waitCtx, waitCancel := context.WithTimeout(d.ctx, 10*time.Second)
+	defer waitCancel()
+
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -205,9 +209,12 @@ func (d *Discovery) maintainConnections() {
 
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-waitCtx.Done():
+		if d.ctx.Err() != nil {
+			// Parent context cancelled, exit gracefully
+			return
+		}
 		log.Printf("[Discovery] maintainConnections timeout, some peers may not be processed")
-	case <-d.ctx.Done():
 	}
 }
 
@@ -412,7 +419,8 @@ func isPublicIP(ip net.IP) bool {
 func (d *Discovery) ConnectToPeer(publicKey string) error {
 	peer := d.peerManager.GetPeer(publicKey)
 	if peer == nil {
-		return nil
+		// FIX: bug.production.5 - Return error when peer not found instead of silent nil
+		return fmt.Errorf("peer not found: %s", publicKey)
 	}
 
 	go d.attemptConnection(peer)
