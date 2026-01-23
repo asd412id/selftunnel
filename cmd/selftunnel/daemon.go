@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,8 +34,185 @@ type Daemon struct {
 	holePuncher *nat.HolePuncher
 	dnsServer   *dns.Server
 	relayClient *relay.Client
+	punchCoord  *punchCoordinator // FIX: Coordinate punch requests to prevent spam
 	ctx         context.Context
 	cancel      context.CancelFunc
+}
+
+// punchCoordinator manages incoming punch requests to prevent spam and thundering herd
+type punchCoordinator struct {
+	mu             sync.Mutex
+	lastPunch      map[string]time.Time // last punch time per peer
+	pendingPunches map[string][]string  // pending endpoints per peer (for coalescing)
+	punchQueue     chan string          // queue of peers to punch
+	activePunches  int                  // current number of active punch operations
+	maxConcurrent  int                  // max concurrent punch operations
+	cooldownPeriod time.Duration        // minimum time between punches to same peer
+	coalesceWindow time.Duration        // time to wait before processing punch (to coalesce)
+	ctx            context.Context
+	cancel         context.CancelFunc
+	discovery      *mesh.Discovery
+	peerManager    *mesh.PeerManager
+}
+
+func newPunchCoordinator(ctx context.Context, discovery *mesh.Discovery, pm *mesh.PeerManager) *punchCoordinator {
+	pctx, cancel := context.WithCancel(ctx)
+	pc := &punchCoordinator{
+		lastPunch:      make(map[string]time.Time),
+		pendingPunches: make(map[string][]string),
+		punchQueue:     make(chan string, 10),  // Buffer up to 10 peers
+		maxConcurrent:  2,                      // Only 2 concurrent punch operations
+		cooldownPeriod: 15 * time.Second,       // 15s cooldown per peer
+		coalesceWindow: 500 * time.Millisecond, // Wait 500ms to coalesce requests
+		ctx:            pctx,
+		cancel:         cancel,
+		discovery:      discovery,
+		peerManager:    pm,
+	}
+	go pc.processQueue()
+	return pc
+}
+
+// RequestPunch queues a punch request (with coalescing)
+func (pc *punchCoordinator) RequestPunch(peerKey string, endpoints []string) bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// Check cooldown
+	if lastTime, exists := pc.lastPunch[peerKey]; exists {
+		if time.Since(lastTime) < pc.cooldownPeriod {
+			log.Printf("[PunchCoord] Ignoring punch request for %s - cooldown (%v remaining)",
+				peerKey[:16], pc.cooldownPeriod-time.Since(lastTime))
+			return false
+		}
+	}
+
+	// Coalesce endpoints - merge with any pending punch for this peer
+	existing := pc.pendingPunches[peerKey]
+	merged := mergeEndpoints(existing, endpoints)
+	pc.pendingPunches[peerKey] = merged
+
+	// If this is a new punch request (not just adding endpoints), schedule it
+	if len(existing) == 0 {
+		// Schedule after coalesce window
+		go func() {
+			select {
+			case <-time.After(pc.coalesceWindow):
+				select {
+				case pc.punchQueue <- peerKey:
+				default:
+					log.Printf("[PunchCoord] Punch queue full, dropping request for %s", peerKey[:16])
+				}
+			case <-pc.ctx.Done():
+			}
+		}()
+	}
+
+	return true
+}
+
+func (pc *punchCoordinator) processQueue() {
+	for {
+		select {
+		case <-pc.ctx.Done():
+			return
+		case peerKey := <-pc.punchQueue:
+			pc.processPunch(peerKey)
+		}
+	}
+}
+
+func (pc *punchCoordinator) processPunch(peerKey string) {
+	pc.mu.Lock()
+
+	// Check if we can start a new punch
+	if pc.activePunches >= pc.maxConcurrent {
+		// Re-queue for later
+		pc.mu.Unlock()
+		time.Sleep(1 * time.Second)
+		select {
+		case pc.punchQueue <- peerKey:
+		default:
+		}
+		return
+	}
+
+	// Get and clear pending endpoints
+	endpoints := pc.pendingPunches[peerKey]
+	delete(pc.pendingPunches, peerKey)
+
+	if len(endpoints) == 0 {
+		pc.mu.Unlock()
+		return
+	}
+
+	// Double-check cooldown (might have changed while in queue)
+	if lastTime, exists := pc.lastPunch[peerKey]; exists {
+		if time.Since(lastTime) < pc.cooldownPeriod {
+			pc.mu.Unlock()
+			return
+		}
+	}
+
+	// Mark as active and update last punch time
+	pc.activePunches++
+	pc.lastPunch[peerKey] = time.Now()
+	pc.mu.Unlock()
+
+	// Get peer info
+	peer := pc.peerManager.GetPeer(peerKey)
+	if peer == nil {
+		pc.mu.Lock()
+		pc.activePunches--
+		pc.mu.Unlock()
+		return
+	}
+
+	log.Printf("[PunchCoord] Processing punch to %s with %d endpoints (active: %d/%d)",
+		peer.Name, len(endpoints), pc.activePunches, pc.maxConcurrent)
+
+	// Update peer endpoints
+	peer.SetEndpoints(endpoints)
+
+	// Only mark as connecting if not already connected
+	if peer.GetState() != mesh.PeerStateConnected {
+		peer.SetState(mesh.PeerStateConnecting)
+	}
+	peer.UpdateLastSeen(false)
+
+	// Execute punch
+	if err := pc.discovery.ConnectToPeer(peerKey); err != nil {
+		log.Printf("[PunchCoord] Failed to connect to %s: %v", peer.Name, err)
+	}
+
+	// Release active slot
+	pc.mu.Lock()
+	pc.activePunches--
+	pc.mu.Unlock()
+}
+
+func (pc *punchCoordinator) Stop() {
+	pc.cancel()
+}
+
+// mergeEndpoints merges two endpoint lists, removing duplicates
+func mergeEndpoints(existing, new []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, ep := range existing {
+		if !seen[ep] {
+			seen[ep] = true
+			result = append(result, ep)
+		}
+	}
+	for _, ep := range new {
+		if !seen[ep] {
+			seen[ep] = true
+			result = append(result, ep)
+		}
+	}
+	return result
 }
 
 // program implements service.Interface for Windows Service support
@@ -207,6 +385,9 @@ func (d *Daemon) Start() error {
 	d.signaling.Start()
 	d.discovery.Start()
 
+	// Initialize punch coordinator to prevent rush/spam
+	d.punchCoord = newPunchCoordinator(d.ctx, d.discovery, d.peerManager)
+
 	// Start DNS server if enabled AND tunnel is running
 	// DNS binds to VirtualIP which only exists if TUN interface is created
 	if d.cfg.DNSEnabled && (d.tun != nil || d.nativeWG != nil) {
@@ -368,7 +549,7 @@ func (d *Daemon) connectRelay() {
 		}
 	})
 
-	// Set up punch coordination handler
+	// Set up punch coordination handler - uses coordinator to prevent spam
 	d.relayClient.SetPunchHandler(func(from string, peerEndpoints []string) {
 		// Get the peer and check state first
 		peer := d.peerManager.GetPeer(from)
@@ -392,33 +573,20 @@ func (d *Daemon) connectRelay() {
 
 		// Merge endpoints: use fresh ones from punch request + existing ones
 		existingEndpoints := peer.GetEndpoints()
-		mergedEndpoints := peerEndpoints
-		for _, ep := range existingEndpoints {
-			found := false
-			for _, pep := range peerEndpoints {
-				if ep == pep {
-					found = true
-					break
-				}
+		mergedEndpoints := mergeEndpoints(existingEndpoints, peerEndpoints)
+
+		// Use punch coordinator to handle the request (with rate limiting and coalescing)
+		if d.punchCoord != nil {
+			d.punchCoord.RequestPunch(from, mergedEndpoints)
+		} else {
+			// Fallback to direct connection if coordinator not initialized
+			peer.SetEndpoints(mergedEndpoints)
+			if peer.GetState() != mesh.PeerStateConnected {
+				peer.SetState(mesh.PeerStateConnecting)
 			}
-			if !found {
-				mergedEndpoints = append(mergedEndpoints, ep)
-			}
+			peer.UpdateLastSeen(false)
+			go d.discovery.ConnectToPeer(from)
 		}
-		peer.SetEndpoints(mergedEndpoints)
-		log.Printf("[Punch] Merged %d endpoints for peer %s", len(mergedEndpoints), peer.Name)
-
-		// Only mark as connecting if not already connected
-		// Don't disturb working connections
-		if peer.GetState() != mesh.PeerStateConnected {
-			peer.SetState(mesh.PeerStateConnecting)
-		}
-
-		// Update LastSeen to prevent false stale detection
-		peer.UpdateLastSeen(false)
-
-		// Start hole punching in background
-		go d.discovery.ConnectToPeer(from)
 	})
 
 	if err := d.relayClient.Connect(); err != nil {
@@ -439,6 +607,11 @@ func (d *Daemon) Stop() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+
+		// Stop punch coordinator first
+		if d.punchCoord != nil {
+			d.punchCoord.Stop()
+		}
 
 		if d.dnsServer != nil {
 			d.dnsServer.Stop()
